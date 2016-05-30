@@ -43,13 +43,15 @@ from charmhelpers.contrib.hahelpers.cluster import (
 from charmhelpers.contrib.openstack.utils import (
     configure_installation_source,
     get_os_codename_install_source,
-    get_os_codename_package,
     git_install_requested,
     git_clone_and_install,
     git_src_dir,
     git_pip_venv_dir,
     get_hostname,
     set_os_workload_status,
+    make_assess_status_func,
+    pause_unit,
+    resume_unit,
 )
 
 from charmhelpers.contrib.openstack.neutron import (
@@ -68,12 +70,9 @@ from charmhelpers.contrib.openstack.context import (
 import charmhelpers.contrib.openstack.templating as templating
 from charmhelpers.contrib.openstack.neutron import headers_package
 from neutron_contexts import (
-    CORE_PLUGIN, OVS, NVP, NSX, N1KV, ONOS,
-    NEUTRON, QUANTUM,
-    networking_name,
+    CORE_PLUGIN, OVS, NSX, N1KV, OVS_ODL,ONOS,
     NeutronGatewayContext,
     L3AgentContext,
-    remap_plugin,
 )
 from charmhelpers.contrib.openstack.neutron import (
     parse_bridge_mappings,
@@ -83,55 +82,27 @@ from copy import deepcopy
 
 
 def valid_plugin():
-    return config('plugin') in CORE_PLUGIN[networking_name()]
+    return config('plugin') in CORE_PLUGIN
 
-QUANTUM_CONF_DIR = '/etc/quantum'
-
-QUANTUM_OVS_PLUGIN_CONF = \
-    "/etc/quantum/plugins/openvswitch/ovs_quantum_plugin.ini"
-QUANTUM_NVP_PLUGIN_CONF = \
-    "/etc/quantum/plugins/nicira/nvp.ini"
-QUANTUM_PLUGIN_CONF = {
-    OVS: QUANTUM_OVS_PLUGIN_CONF,
-    NVP: QUANTUM_NVP_PLUGIN_CONF,
-}
+NEUTRON_COMMON = 'neutron-common'
 
 NEUTRON_CONF_DIR = '/etc/neutron'
 
-NEUTRON_OVS_PLUGIN_CONF = \
-    "/etc/neutron/plugins/openvswitch/ovs_neutron_plugin.ini"
 NEUTRON_ML2_PLUGIN_CONF = \
     "/etc/neutron/plugins/ml2/ml2_conf.ini"
+NEUTRON_OVS_AGENT_CONF = \
+    "/etc/neutron/plugins/ml2/openvswitch_agent.ini"
 NEUTRON_NVP_PLUGIN_CONF = \
     "/etc/neutron/plugins/nicira/nvp.ini"
 NEUTRON_NSX_PLUGIN_CONF = \
     "/etc/neutron/plugins/vmware/nsx.ini"
 
 NEUTRON_PLUGIN_CONF = {
-    OVS: NEUTRON_OVS_PLUGIN_CONF,
-    NVP: NEUTRON_NVP_PLUGIN_CONF,
+    OVS: NEUTRON_ML2_PLUGIN_CONF,
     NSX: NEUTRON_NSX_PLUGIN_CONF,
 }
 
-QUANTUM_GATEWAY_PKGS = {
-    OVS: [
-        "quantum-plugin-openvswitch-agent",
-        "quantum-l3-agent",
-        "quantum-dhcp-agent",
-        'python-mysqldb',
-        'python-psycopg2',
-        "nova-api-metadata"
-    ],
-    NVP: [
-        "openvswitch-switch",
-        "quantum-dhcp-agent",
-        'python-mysqldb',
-        'python-psycopg2',
-        "nova-api-metadata"
-    ]
-}
-
-NEUTRON_GATEWAY_PKGS = {
+GATEWAY_PKGS = {
     OVS: [
         "neutron-plugin-openvswitch-agent",
         "openvswitch-switch",
@@ -141,10 +112,10 @@ NEUTRON_GATEWAY_PKGS = {
         'python-psycopg2',
         'python-oslo.config',  # Force upgrade
         "nova-api-metadata",
-        "neutron-plugin-metering-agent",
+        "neutron-metering-agent",
         "neutron-lbaas-agent",
     ],
-    NVP: [
+    NSX: [
         "neutron-dhcp-agent",
         'python-mysqldb',
         'python-psycopg2',
@@ -160,25 +131,28 @@ NEUTRON_GATEWAY_PKGS = {
         "neutron-common",
         "neutron-l3-agent"
     ],
+    OVS_ODL: [
+        "openvswitch-switch",
+        "neutron-l3-agent",
+        "neutron-dhcp-agent",
+        "nova-api-metadata",
+        "neutron-metering-agent",
+        "neutron-lbaas-agent",
+    ],
     ONOS: [
         "openvswitch-switch",
         "neutron-dhcp-agent",
         "nova-api-metadata",
-        "neutron-plugin-metering-agent",
+        "neutron-metering-agent",
         "neutron-lbaas-agent",
     ],
-}
-NEUTRON_GATEWAY_PKGS[NSX] = NEUTRON_GATEWAY_PKGS[NVP]
-
-GATEWAY_PKGS = {
-    QUANTUM: QUANTUM_GATEWAY_PKGS,
-    NEUTRON: NEUTRON_GATEWAY_PKGS,
 }
 
 EARLY_PACKAGES = {
     OVS: ['openvswitch-datapath-dkms'],
-    NVP: [],
+    NSX: [],
     N1KV: [],
+    OVS_ODL: [],
     ONOS: [],
 }
 
@@ -224,7 +198,6 @@ GIT_PACKAGE_BLACKLIST = [
     'neutron-plugin-cisco',
     'neutron-plugin-metering-agent',
     'neutron-plugin-openvswitch-agent',
-    'neutron-plugin-vpn-agent',
     'neutron-vpn-agent',
     'python-neutron-fwaas',
     'python-oslo.config',
@@ -258,8 +231,8 @@ def get_early_packages():
 
 def get_packages():
     '''Return a list of packages for install based on the configured plugin'''
-    plugin = remap_plugin(config('plugin'))
-    packages = deepcopy(GATEWAY_PKGS[networking_name()][plugin])
+    plugin = config('plugin')
+    packages = deepcopy(GATEWAY_PKGS[plugin])
     source = get_os_codename_install_source(config('openstack-origin'))
     if plugin == 'ovs':
         if (source >= 'icehouse' and
@@ -275,9 +248,10 @@ def get_packages():
             # Switch out mysql driver
             packages.remove('python-mysqldb')
             packages.append('python-pymysql')
-            # Switch out to actual metering agent package
-            packages.remove('neutron-plugin-metering-agent')
-            packages.append('neutron-metering-agent')
+        if source >= 'mitaka':
+            # Switch out to actual ovs agent package
+            packages.remove('neutron-plugin-openvswitch-agent')
+            packages.append('neutron-openvswitch-agent')
     packages.extend(determine_l3ha_packages())
 
     if git_install_requested():
@@ -297,18 +271,13 @@ def determine_l3ha_packages():
     return []
 
 
-def get_common_package():
-    if get_os_codename_package('quantum-common', fatal=False) is not None:
-        return 'quantum-common'
-    else:
-        return 'neutron-common'
-
-
 def use_l3ha():
     return NeutronAPIContext()()['enable_l3ha']
 
 EXT_PORT_CONF = '/etc/init/ext-port.conf'
 PHY_NIC_MTU_CONF = '/etc/init/os-charm-phy-nic-mtu.conf'
+STOPPED_SERVICES = ['os-charm-phy-nic-mtu', 'ext-port']
+
 TEMPLATES = 'templates'
 
 QUANTUM_CONF = "/etc/quantum/quantum.conf"
@@ -340,19 +309,6 @@ NOVA_CONFIG_FILES = {
     },
 }
 
-QUANTUM_SHARED_CONFIG_FILES = {
-    QUANTUM_DHCP_AGENT_CONF: {
-        'hook_contexts': [NeutronGatewayContext()],
-        'services': ['quantum-dhcp-agent']
-    },
-    QUANTUM_METADATA_AGENT_CONF: {
-        'hook_contexts': [NetworkServiceContext(),
-                          NeutronGatewayContext()],
-        'services': ['quantum-metadata-agent']
-    },
-}
-QUANTUM_SHARED_CONFIG_FILES.update(NOVA_CONFIG_FILES)
-
 NEUTRON_SHARED_CONFIG_FILES = {
     NEUTRON_DHCP_AGENT_CONF: {
         'hook_contexts': [NeutronGatewayContext()],
@@ -370,38 +326,6 @@ NEUTRON_SHARED_CONFIG_FILES = {
 }
 NEUTRON_SHARED_CONFIG_FILES.update(NOVA_CONFIG_FILES)
 
-QUANTUM_OVS_CONFIG_FILES = {
-    QUANTUM_CONF: {
-        'hook_contexts': [context.AMQPContext(ssl_dir=QUANTUM_CONF_DIR),
-                          NeutronGatewayContext(),
-                          SyslogContext(),
-                          context.ZeroMQContext(),
-                          context.NotificationDriverContext()],
-        'services': ['quantum-l3-agent',
-                     'quantum-dhcp-agent',
-                     'quantum-metadata-agent',
-                     'quantum-plugin-openvswitch-agent']
-    },
-    QUANTUM_L3_AGENT_CONF: {
-        'hook_contexts': [NetworkServiceContext(),
-                          NeutronGatewayContext()],
-        'services': ['quantum-l3-agent']
-    },
-    QUANTUM_OVS_PLUGIN_CONF: {
-        'hook_contexts': [NeutronGatewayContext()],
-        'services': ['quantum-plugin-openvswitch-agent']
-    },
-    EXT_PORT_CONF: {
-        'hook_contexts': [ExternalPortContext()],
-        'services': ['ext-port']
-    },
-    PHY_NIC_MTU_CONF: {
-        'hook_contexts': [PhyNICMTUContext()],
-        'services': ['os-charm-phy-nic-mtu']
-    }
-}
-QUANTUM_OVS_CONFIG_FILES.update(QUANTUM_SHARED_CONFIG_FILES)
-
 NEUTRON_OVS_CONFIG_FILES = {
     NEUTRON_CONF: {
         'hook_contexts': [context.AMQPContext(ssl_dir=NEUTRON_CONF_DIR),
@@ -416,7 +340,6 @@ NEUTRON_OVS_CONFIG_FILES = {
                      'neutron-plugin-metering-agent',
                      'neutron-metering-agent',
                      'neutron-lbaas-agent',
-                     'neutron-plugin-vpn-agent',
                      'neutron-vpn-agent']
     },
     NEUTRON_L3_AGENT_CONF: {
@@ -436,20 +359,23 @@ NEUTRON_OVS_CONFIG_FILES = {
     },
     NEUTRON_VPNAAS_AGENT_CONF: {
         'hook_contexts': [NeutronGatewayContext()],
-        'services': ['neutron-plugin-vpn-agent',
-                     'neutron-vpn-agent']
+        'services': ['neutron-vpn-agent']
     },
     NEUTRON_FWAAS_CONF: {
         'hook_contexts': [NeutronGatewayContext()],
         'services': ['neutron-l3-agent', 'neutron-vpn-agent']
     },
-    NEUTRON_OVS_PLUGIN_CONF: {
+    NEUTRON_ML2_PLUGIN_CONF: {
         'hook_contexts': [NeutronGatewayContext()],
         'services': ['neutron-plugin-openvswitch-agent']
     },
     NEUTRON_ML2_PLUGIN_CONF: {
         'hook_contexts': [NeutronGatewayContext()],
         'services': ['neutron-plugin-openvswitch-agent']
+    },
+    NEUTRON_OVS_AGENT_CONF: {
+        'hook_contexts': [NeutronGatewayContext()],
+        'services': ['neutron-openvswitch-agent']
     },
     EXT_PORT_CONF: {
         'hook_contexts': [ExternalPortContext()],
@@ -461,6 +387,55 @@ NEUTRON_OVS_CONFIG_FILES = {
     }
 }
 NEUTRON_OVS_CONFIG_FILES.update(NEUTRON_SHARED_CONFIG_FILES)
+
+NEUTRON_OVS_ODL_CONFIG_FILES = {
+    NEUTRON_CONF: {
+        'hook_contexts': [context.AMQPContext(ssl_dir=NEUTRON_CONF_DIR),
+                          NeutronGatewayContext(),
+                          SyslogContext(),
+                          context.ZeroMQContext(),
+                          context.NotificationDriverContext()],
+        'services': ['neutron-l3-agent',
+                     'neutron-dhcp-agent',
+                     'neutron-metadata-agent',
+                     'neutron-plugin-metering-agent',
+                     'neutron-metering-agent',
+                     'neutron-lbaas-agent',
+                     'neutron-vpn-agent']
+    },
+    NEUTRON_L3_AGENT_CONF: {
+        'hook_contexts': [NetworkServiceContext(),
+                          L3AgentContext(),
+                          NeutronGatewayContext()],
+        'services': ['neutron-l3-agent', 'neutron-vpn-agent']
+    },
+    NEUTRON_METERING_AGENT_CONF: {
+        'hook_contexts': [NeutronGatewayContext()],
+        'services': ['neutron-plugin-metering-agent',
+                     'neutron-metering-agent']
+    },
+    NEUTRON_LBAAS_AGENT_CONF: {
+        'hook_contexts': [NeutronGatewayContext()],
+        'services': ['neutron-lbaas-agent']
+    },
+    NEUTRON_VPNAAS_AGENT_CONF: {
+        'hook_contexts': [NeutronGatewayContext()],
+        'services': ['neutron-vpn-agent']
+    },
+    NEUTRON_FWAAS_CONF: {
+        'hook_contexts': [NeutronGatewayContext()],
+        'services': ['neutron-l3-agent', 'neutron-vpn-agent']
+    },
+    EXT_PORT_CONF: {
+        'hook_contexts': [ExternalPortContext()],
+        'services': ['ext-port']
+    },
+    PHY_NIC_MTU_CONF: {
+        'hook_contexts': [PhyNICMTUContext()],
+        'services': ['os-charm-phy-nic-mtu']
+    }
+}
+NEUTRON_OVS_ODL_CONFIG_FILES.update(NEUTRON_SHARED_CONFIG_FILES)
 
 NEUTRON_ONOS_CONFIG_FILES = {
     NEUTRON_CONF: {
@@ -474,7 +449,6 @@ NEUTRON_ONOS_CONFIG_FILES = {
                      'neutron-plugin-metering-agent',
                      'neutron-metering-agent',
                      'neutron-lbaas-agent',
-                     'neutron-plugin-vpn-agent',
                      'neutron-vpn-agent']
     },
     NEUTRON_METERING_AGENT_CONF: {
@@ -488,8 +462,7 @@ NEUTRON_ONOS_CONFIG_FILES = {
     },
     NEUTRON_VPNAAS_AGENT_CONF: {
         'hook_contexts': [NeutronGatewayContext()],
-        'services': ['neutron-plugin-vpn-agent',
-                     'neutron-vpn-agent']
+        'services': ['neutron-vpn-agent']
     },
     NEUTRON_FWAAS_CONF: {
         'hook_contexts': [NeutronGatewayContext()],
@@ -506,18 +479,7 @@ NEUTRON_ONOS_CONFIG_FILES = {
 }
 NEUTRON_ONOS_CONFIG_FILES.update(NEUTRON_SHARED_CONFIG_FILES)
 
-
-QUANTUM_NVP_CONFIG_FILES = {
-    QUANTUM_CONF: {
-        'hook_contexts': [context.AMQPContext(ssl_dir=QUANTUM_CONF_DIR),
-                          NeutronGatewayContext(),
-                          SyslogContext()],
-        'services': ['quantum-dhcp-agent', 'quantum-metadata-agent']
-    },
-}
-QUANTUM_NVP_CONFIG_FILES.update(QUANTUM_SHARED_CONFIG_FILES)
-
-NEUTRON_NVP_CONFIG_FILES = {
+NEUTRON_NSX_CONFIG_FILES = {
     NEUTRON_CONF: {
         'hook_contexts': [context.AMQPContext(ssl_dir=NEUTRON_CONF_DIR),
                           NeutronGatewayContext(),
@@ -525,7 +487,7 @@ NEUTRON_NVP_CONFIG_FILES = {
         'services': ['neutron-dhcp-agent', 'neutron-metadata-agent']
     },
 }
-NEUTRON_NVP_CONFIG_FILES.update(NEUTRON_SHARED_CONFIG_FILES)
+NEUTRON_NSX_CONFIG_FILES.update(NEUTRON_SHARED_CONFIG_FILES)
 
 NEUTRON_N1KV_CONFIG_FILES = {
     NEUTRON_CONF: {
@@ -546,35 +508,64 @@ NEUTRON_N1KV_CONFIG_FILES = {
 NEUTRON_N1KV_CONFIG_FILES.update(NEUTRON_SHARED_CONFIG_FILES)
 
 CONFIG_FILES = {
-    QUANTUM: {
-        NVP: QUANTUM_NVP_CONFIG_FILES,
-        OVS: QUANTUM_OVS_CONFIG_FILES,
+    NSX: NEUTRON_NSX_CONFIG_FILES,
+    OVS: NEUTRON_OVS_CONFIG_FILES,
+    N1KV: NEUTRON_N1KV_CONFIG_FILES,
+    OVS_ODL: NEUTRON_OVS_ODL_CONFIG_FILES,
+    ONOS: NEUTRON_ONOS_CONFIG_FILES
+}
+
+SERVICE_RENAMES = {
+    'icehouse': {
+        'neutron-plugin-metering-agent': 'neutron-metering-agent',
     },
-    NEUTRON: {
-        NSX: NEUTRON_NVP_CONFIG_FILES,
-        NVP: NEUTRON_NVP_CONFIG_FILES,
-        OVS: NEUTRON_OVS_CONFIG_FILES,
-        N1KV: NEUTRON_N1KV_CONFIG_FILES,
-        ONOS: NEUTRON_ONOS_CONFIG_FILES
+    'mitaka': {
+        'neutron-plugin-openvswitch-agent': 'neutron-openvswitch-agent',
     },
 }
 
 
-def register_configs():
-    ''' Register config files with their respective contexts. '''
-    release = get_os_codename_install_source(config('openstack-origin'))
-    configs = templating.OSConfigRenderer(templates_dir=TEMPLATES,
-                                          openstack_release=release)
+def remap_service(service_name):
+    '''
+    Remap service names based on openstack release to deal
+    with changes to packaging
 
-    plugin = remap_plugin(config('plugin'))
-    name = networking_name()
-    if plugin == 'ovs':
+    :param service_name: name of service to remap
+    :returns: remapped service name or original value
+    '''
+    source = get_os_codename_install_source(config('openstack-origin'))
+    for rename_source in SERVICE_RENAMES:
+        if (source >= rename_source and
+                service_name in SERVICE_RENAMES[rename_source]):
+            service_name = SERVICE_RENAMES[rename_source][service_name]
+    return service_name
+
+
+def resolve_config_files(plugin, release):
+    '''
+    Resolve configuration files and contexts
+
+    :param plugin: shortname of plugin e.g. ovs
+    :param release: openstack release codename
+    :returns: dict of configuration files, contexts
+              and associated services
+    '''
+    config_files = deepcopy(CONFIG_FILES)
+    drop_config = []
+    if plugin == OVS:
         # NOTE: deal with switch to ML2 plugin for >= icehouse
-        drop_config = NEUTRON_ML2_PLUGIN_CONF
-        if release >= 'icehouse':
-            drop_config = NEUTRON_OVS_PLUGIN_CONF
-        if drop_config in CONFIG_FILES[name][plugin]:
-            CONFIG_FILES[name][plugin].pop(drop_config)
+        drop_config = [NEUTRON_OVS_AGENT_CONF]
+        if release >= 'mitaka':
+            # ml2 -> ovs_agent
+            drop_config = [NEUTRON_ML2_PLUGIN_CONF]
+
+    # Use MAAS1.9 for MTU and external port config on xenial and above
+    if lsb_release()['DISTRIB_CODENAME'] >= 'xenial':
+        drop_config.extend([EXT_PORT_CONF, PHY_NIC_MTU_CONF])
+
+    for _config in drop_config:
+        if _config in config_files[plugin]:
+            config_files[plugin].pop(_config)
 
     if is_relation_made('amqp-nova'):
         amqp_nova_ctxt = context.AMQPContext(
@@ -585,20 +576,32 @@ def register_configs():
         amqp_nova_ctxt = context.AMQPContext(
             ssl_dir=NOVA_CONF_DIR,
             rel_name='amqp')
-    CONFIG_FILES[name][plugin][NOVA_CONF][
+    config_files[plugin][NOVA_CONF][
         'hook_contexts'].append(amqp_nova_ctxt)
-    for conf in CONFIG_FILES[name][plugin]:
+    return config_files
+
+
+def register_configs():
+    ''' Register config files with their respective contexts. '''
+    release = get_os_codename_install_source(config('openstack-origin'))
+    plugin = config('plugin')
+    config_files = resolve_config_files(plugin, release)
+    configs = templating.OSConfigRenderer(templates_dir=TEMPLATES,
+                                          openstack_release=release)
+    for conf in config_files[plugin]:
         configs.register(conf,
-                         CONFIG_FILES[name][plugin][conf]['hook_contexts'])
+                         config_files[plugin][conf]['hook_contexts'])
     return configs
 
 
 def stop_services():
-    name = networking_name()
+    release = get_os_codename_install_source(config('openstack-origin'))
+    plugin = config('plugin')
+    config_files = resolve_config_files(plugin, release)
     svcs = set()
-    for ctxt in CONFIG_FILES[name][config('plugin')].itervalues():
+    for ctxt in config_files[config('plugin')].itervalues():
         for svc in ctxt['services']:
-            svcs.add(svc)
+            svcs.add(remap_service(svc))
     for svc in svcs:
         service_stop(svc)
 
@@ -611,15 +614,21 @@ def restart_map():
     :returns: dict: A dictionary mapping config file to lists of services
                     that should be restarted when file changes.
     '''
-    _map = {}
+    release = get_os_codename_install_source(config('openstack-origin'))
     plugin = config('plugin')
-    name = networking_name()
-    for f, ctxt in CONFIG_FILES[name][plugin].iteritems():
-        svcs = []
+    config_files = resolve_config_files(plugin, release)
+    _map = {}
+    enable_vpn_agent = 'neutron-vpn-agent' in get_packages()
+    for f, ctxt in config_files[plugin].iteritems():
+        svcs = set()
         for svc in ctxt['services']:
-            svcs.append(svc)
+            svcs.add(remap_service(svc))
+        if not enable_vpn_agent and 'neutron-vpn-agent' in svcs:
+            svcs.remove('neutron-vpn-agent')
+        if 'neutron-vpn-agent' in svcs and 'neutron-l3-agent' in svcs:
+            svcs.remove('neutron-l3-agent')
         if svcs:
-            _map[f] = svcs
+            _map[f] = list(svcs)
     return _map
 
 
@@ -744,10 +753,11 @@ def do_openstack_upgrade(configs):
 
 
 def configure_ovs():
-    if config('plugin') in [OVS, ONOS]:
+    if config('plugin') in [OVS, OVS_ODL, ONOS]:
         if not service_running('openvswitch-switch'):
             full_restart()
-       #add_bridge(INT_BRIDGE)
+        if config('plugin') in [OVS, OVS_ODL]:
+            add_bridge(INT_BRIDGE)
         add_bridge(EXT_BRIDGE)
         ext_port_ctx = ExternalPortContext()()
         if ext_port_ctx and ext_port_ctx['ext_port']:
@@ -1260,3 +1270,72 @@ def check_optional_relations(configs):
         return status_get()
     else:
         return 'unknown', 'No optional relations'
+
+
+def assess_status(configs):
+    """Assess status of current unit
+    Decides what the state of the unit should be based on the current
+    configuration.
+    SIDE EFFECT: calls set_os_workload_status(...) which sets the workload
+    status of the unit.
+    Also calls status_set(...) directly if paused state isn't complete.
+    @param configs: a templating.OSConfigRenderer() object
+    @returns None - this function is executed for its side-effect
+    """
+    assess_status_func(configs)()
+
+
+def assess_status_func(configs):
+    """Helper function to create the function that will assess_status() for
+    the unit.
+    Uses charmhelpers.contrib.openstack.utils.make_assess_status_func() to
+    create the appropriate status function and then returns it.
+    Used directly by assess_status() and also for pausing and resuming
+    the unit.
+
+    NOTE(ajkavanagh) ports are not checked due to race hazards with services
+    that don't behave sychronously w.r.t their service scripts.  e.g.
+    apache2.
+    @param configs: a templating.OSConfigRenderer() object
+    @return f() -> None : a function that assesses the unit's workload status
+    """
+    active_services = [s for s in services() if s not in STOPPED_SERVICES]
+    return make_assess_status_func(
+        configs, REQUIRED_INTERFACES,
+        charm_func=check_optional_relations,
+        services=active_services, ports=None)
+
+
+def pause_unit_helper(configs):
+    """Helper function to pause a unit, and then call assess_status(...) in
+    effect, so that the status is correctly updated.
+    Uses charmhelpers.contrib.openstack.utils.pause_unit() to do the work.
+    @param configs: a templating.OSConfigRenderer() object
+    @returns None - this function is executed for its side-effect
+    """
+    _pause_resume_helper(pause_unit, configs)
+
+
+def resume_unit_helper(configs):
+    """Helper function to resume a unit, and then call assess_status(...) in
+    effect, so that the status is correctly updated.
+    Uses charmhelpers.contrib.openstack.utils.resume_unit() to do the work.
+    @param configs: a templating.OSConfigRenderer() object
+    @returns None - this function is executed for its side-effect
+    """
+    _pause_resume_helper(resume_unit, configs)
+
+
+def _pause_resume_helper(f, configs):
+    """Helper function that uses the make_assess_status_func(...) from
+    charmhelpers.contrib.openstack.utils to create an assess_status(...)
+    function that can be used with the pause/resume of the unit
+    @param f: the function to be used with the assess_status(...) function
+    @returns None - this function is executed for its side-effect
+    """
+    active_services = [s for s in services() if s not in STOPPED_SERVICES]
+    # TODO(ajkavanagh) - ports= has been left off because of the race hazard
+    # that exists due to service_start()
+    f(assess_status_func(configs),
+      services=active_services,
+      ports=None)

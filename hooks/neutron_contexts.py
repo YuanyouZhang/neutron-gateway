@@ -5,7 +5,8 @@ import socket
 from charmhelpers.core.hookenv import (
     config,
     unit_get,
-    cached
+    cached,
+    network_get_primary_address,
 )
 from charmhelpers.fetch import (
     apt_install,
@@ -13,9 +14,7 @@ from charmhelpers.fetch import (
 from charmhelpers.contrib.openstack.context import (
     OSContextGenerator,
     NeutronAPIContext,
-)
-from charmhelpers.contrib.openstack.utils import (
-    get_os_codename_install_source
+    config_flags_parser
 )
 from charmhelpers.contrib.hahelpers.cluster import(
     eligible_leader
@@ -24,77 +23,31 @@ from charmhelpers.contrib.network.ip import (
     get_address_in_network,
 )
 
-DB_USER = "quantum"
-QUANTUM_DB = "quantum"
-NOVA_DB_USER = "nova"
-NOVA_DB = "nova"
-
-QUANTUM_OVS_PLUGIN = \
-    "quantum.plugins.openvswitch.ovs_quantum_plugin.OVSQuantumPluginV2"
-QUANTUM_NVP_PLUGIN = \
-    "quantum.plugins.nicira.nicira_nvp_plugin.QuantumPlugin.NvpPluginV2"
-NEUTRON_OVS_PLUGIN = \
-    "neutron.plugins.openvswitch.ovs_neutron_plugin.OVSNeutronPluginV2"
-NEUTRON_ML2_PLUGIN = \
-    "neutron.plugins.ml2.plugin.Ml2Plugin"
-NEUTRON_NVP_PLUGIN = \
-    "neutron.plugins.nicira.nicira_nvp_plugin.NeutronPlugin.NvpPluginV2"
+NEUTRON_ML2_PLUGIN = "ml2"
 NEUTRON_N1KV_PLUGIN = \
     "neutron.plugins.cisco.n1kv.n1kv_neutron_plugin.N1kvNeutronPluginV2"
 NEUTRON_NSX_PLUGIN = "vmware"
+NEUTRON_OVS_ODL_PLUGIN = "ml2"
 NEUTRON_ONOS_PLUGIN = "ml2"
 
-NEUTRON = 'neutron'
-QUANTUM = 'quantum'
-
-
-def networking_name():
-    ''' Determine whether neutron or quantum should be used for name '''
-    if get_os_codename_install_source(config('openstack-origin')) >= 'havana':
-        return NEUTRON
-    else:
-        return QUANTUM
-
 OVS = 'ovs'
-NVP = 'nvp'
 N1KV = 'n1kv'
 NSX = 'nsx'
-ONOS = 'ovs-odl'
+OVS_ODL = 'ovs-odl'
 ONOS = 'onos'
+NEUTRON = 'neutron'
 
 CORE_PLUGIN = {
-    QUANTUM: {
-        OVS: QUANTUM_OVS_PLUGIN,
-        NVP: QUANTUM_NVP_PLUGIN,
-    },
-    NEUTRON: {
-        OVS: NEUTRON_OVS_PLUGIN,
-        NVP: NEUTRON_NVP_PLUGIN,
-        N1KV: NEUTRON_N1KV_PLUGIN,
-        NSX: NEUTRON_NSX_PLUGIN,
-        ONOS: NEUTRON_ONOS_PLUGIN,
-    },
+    OVS: NEUTRON_ML2_PLUGIN,
+    N1KV: NEUTRON_N1KV_PLUGIN,
+    NSX: NEUTRON_NSX_PLUGIN,
+    OVS_ODL: NEUTRON_OVS_ODL_PLUGIN,
+    ONOS: NEUTRON_ONOS_PLUGIN,
 }
 
 
-def remap_plugin(plugin):
-    ''' Remaps plugin name for renames/switches in packaging '''
-    release = get_os_codename_install_source(config('openstack-origin'))
-    if plugin == 'nvp' and release >= 'icehouse':
-        plugin = 'nsx'
-    elif plugin == 'nsx' and release < 'icehouse':
-        plugin = 'nvp'
-    return plugin
-
-
 def core_plugin():
-    plugin = remap_plugin(config('plugin'))
-    if (get_os_codename_install_source(config('openstack-origin'))
-            >= 'icehouse'
-            and plugin == OVS):
-        return NEUTRON_ML2_PLUGIN
-    else:
-        return CORE_PLUGIN[networking_name()][plugin]
+    return CORE_PLUGIN[config('plugin')]
 
 
 class L3AgentContext(OSContextGenerator):
@@ -128,9 +81,6 @@ class NeutronGatewayContext(NeutronAPIContext):
         api_settings = super(NeutronGatewayContext, self).__call__()
         ctxt = {
             'shared_secret': get_shared_secret(),
-            'local_ip':
-            get_address_in_network(config('os-data-network'),
-                                   get_host_ip(unit_get('private-address'))),
             'core_plugin': core_plugin(),
             'plugin': config('plugin'),
             'debug': config('debug'),
@@ -143,6 +93,21 @@ class NeutronGatewayContext(NeutronAPIContext):
             api_settings['overlay_network_type'],
         }
 
+        fallback = get_host_ip(unit_get('private-address'))
+        if config('os-data-network'):
+            # NOTE: prefer any existing use of config based networking
+            ctxt['local_ip'] = \
+                get_address_in_network(config('os-data-network'),
+                                       fallback)
+        else:
+            # NOTE: test out network-spaces support, then fallback
+            try:
+                ctxt['local_ip'] = get_host_ip(
+                    network_get_primary_address('data')
+                )
+            except NotImplementedError:
+                ctxt['local_ip'] = fallback
+
         mappings = config('bridge-mappings')
         if mappings:
             ctxt['bridge_mappings'] = ','.join(mappings.split())
@@ -154,6 +119,10 @@ class NeutronGatewayContext(NeutronAPIContext):
         vlan_ranges = config('vlan-ranges')
         if vlan_ranges:
             ctxt['vlan_ranges'] = ','.join(vlan_ranges.split())
+
+        dnsmasq_flags = config('dnsmasq-flags')
+        if dnsmasq_flags:
+            ctxt['dnsmasq_flags'] = config_flags_parser(dnsmasq_flags)
 
         net_dev_mtu = api_settings['network_device_mtu']
         if net_dev_mtu:
@@ -186,7 +155,7 @@ SHARED_SECRET = "/etc/{}/secret.txt"
 
 def get_shared_secret():
     secret = None
-    _path = SHARED_SECRET.format(networking_name())
+    _path = SHARED_SECRET.format(NEUTRON)
     if not os.path.exists(_path):
         secret = str(uuid.uuid4())
         with open(_path, 'w') as secret_file:

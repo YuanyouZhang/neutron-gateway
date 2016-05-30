@@ -1,18 +1,21 @@
-from mock import MagicMock, patch, call
+import sys
+
 import yaml
+
+from mock import MagicMock, patch, call
+
+# python-apt is not installed as part of test-requirements but is imported by
+# some charmhelpers modules so create a fake import.
+sys.modules['apt'] = MagicMock()
+sys.modules['apt_pkg'] = MagicMock()
+
 import charmhelpers.core.hookenv as hookenv
-hookenv.config = MagicMock()
-import neutron_utils as utils
-_register_configs = utils.register_configs
-_restart_map = utils.restart_map
-utils.register_configs = MagicMock()
-utils.restart_map = MagicMock()
-
-with patch('charmhelpers.core.hookenv.status_set'):
+with patch('charmhelpers.contrib.hardening.harden.harden') as \
+        mock_dec:
+    mock_dec.side_effect = (lambda *dargs, **dkwargs: lambda f:
+                            lambda *args, **kwargs:
+                                f(*args, **kwargs))
     import neutron_hooks as hooks
-
-utils.register_configs = _register_configs
-utils.restart_map = _restart_map
 
 from test_utils import CharmTestCase
 
@@ -35,15 +38,12 @@ TO_PATCH = [
     'configure_ovs',
     'relation_set',
     'relation_ids',
-    'unit_get',
     'relation_get',
     'install_ca_cert',
-    'get_common_package',
     'execd_preinstall',
     'lsb_release',
     'stop_services',
     'b64decode',
-    'is_relation_made',
     'create_sysctl',
     'update_nrpe_config',
     'update_legacy_ha_files',
@@ -54,11 +54,10 @@ TO_PATCH = [
     'cleanup_ovs_netns',
     'stop_neutron_ha_monitor_daemon',
     'use_l3ha',
+    'kv',
+    'service_restart',
+    'is_unit_paused_set',
 ]
-
-
-def passthrough(value):
-    return value
 
 
 class TestQuantumHooks(CharmTestCase):
@@ -69,7 +68,8 @@ class TestQuantumHooks(CharmTestCase):
         self.test_config.set('openstack-origin', 'cloud:precise-havana')
         self.test_config.set('plugin', 'ovs')
         self.lsb_release.return_value = {'DISTRIB_CODENAME': 'precise'}
-        self.b64decode.side_effect = passthrough
+        # passthrough
+        self.b64decode.side_effect = lambda arg: arg
         hookenv.config.side_effect = self.test_config.get
         hooks.hooks._config_save = False
 
@@ -81,7 +81,7 @@ class TestQuantumHooks(CharmTestCase):
         self.valid_plugin.return_value = True
         _pkgs = ['foo', 'bar']
         self.filter_installed_packages.return_value = _pkgs
-        self._call_hook('install')
+        self._call_hook('install.real')
         self.configure_installation_source.assert_called_with(
             'cloud:precise-havana'
         )
@@ -96,19 +96,19 @@ class TestQuantumHooks(CharmTestCase):
 
     def test_install_hook_precise_nocloudarchive(self):
         self.test_config.set('openstack-origin', 'distro')
-        self._call_hook('install')
+        self._call_hook('install.real')
         self.configure_installation_source.assert_called_with(
-            'cloud:precise-folsom'
+            'cloud:precise-icehouse'
         )
 
     @patch('sys.exit')
     def test_install_hook_invalid_plugin(self, _exit):
         self.valid_plugin.return_value = False
-        self._call_hook('install')
+        self._call_hook('install.real')
         self.assertTrue(self.log.called)
         _exit.assert_called_with(1)
 
-    @patch.object(utils, 'git_install_requested')
+    @patch('neutron_utils.git_install_requested')
     def test_install_hook_git(self, git_requested):
         git_requested.return_value = True
         self.valid_plugin.return_value = True
@@ -129,7 +129,7 @@ class TestQuantumHooks(CharmTestCase):
         projects_yaml = yaml.dump(openstack_origin_git)
         self.test_config.set('openstack-origin', repo)
         self.test_config.set('openstack-origin-git', projects_yaml)
-        self._call_hook('install')
+        self._call_hook('install.real')
         self.configure_installation_source.assert_called_with(
             'cloud:trusty-juno'
         )
@@ -152,16 +152,12 @@ class TestQuantumHooks(CharmTestCase):
         self.openstack_upgrade_available.return_value = True
         self.valid_plugin.return_value = True
         self.relation_ids.side_effect = mock_relids
-        _db_joined = self.patch('db_joined')
-        _pgsql_db_joined = self.patch('pgsql_db_joined')
         _amqp_joined = self.patch('amqp_joined')
         _amqp_nova_joined = self.patch('amqp_nova_joined')
         _zmq_joined = self.patch('zeromq_configuration_relation_joined')
         self._call_hook('config-changed')
         self.assertTrue(self.do_openstack_upgrade.called)
         self.assertTrue(self.configure_ovs.called)
-        self.assertTrue(_db_joined.called)
-        self.assertTrue(_pgsql_db_joined.called)
         self.assertTrue(_amqp_joined.called)
         self.assertTrue(_amqp_nova_joined.called)
         self.assertTrue(_zmq_joined.called)
@@ -208,8 +204,6 @@ class TestQuantumHooks(CharmTestCase):
         self.openstack_upgrade_available.return_value = True
         self.valid_plugin.return_value = True
         self.relation_ids.side_effect = mock_relids
-        _db_joined = self.patch('db_joined')
-        _pgsql_db_joined = self.patch('pgsql_db_joined')
         _amqp_joined = self.patch('amqp_joined')
         _amqp_nova_joined = self.patch('amqp_nova_joined')
         _zmq_joined = self.patch('zeromq_configuration_relation_joined')
@@ -233,8 +227,6 @@ class TestQuantumHooks(CharmTestCase):
         self.git_install.assert_called_with(projects_yaml)
         self.assertFalse(self.do_openstack_upgrade.called)
         self.assertTrue(self.configure_ovs.called)
-        self.assertTrue(_db_joined.called)
-        self.assertTrue(_pgsql_db_joined.called)
         self.assertTrue(_amqp_joined.called)
         self.assertTrue(_amqp_nova_joined.called)
         self.assertTrue(_zmq_joined.called)
@@ -246,44 +238,6 @@ class TestQuantumHooks(CharmTestCase):
         self._call_hook('upgrade-charm')
         self.assertTrue(_install.called)
         self.assertTrue(_config_changed.called)
-
-    def test_db_joined(self):
-        self.is_relation_made.return_value = False
-        self.unit_get.return_value = 'myhostname'
-        self._call_hook('shared-db-relation-joined')
-        self.relation_set.assert_called_with(
-            username='nova',
-            database='nova',
-            hostname='myhostname',
-            relation_id=None
-        )
-
-    def test_db_joined_with_postgresql(self):
-        self.is_relation_made.return_value = True
-
-        with self.assertRaises(Exception) as context:
-            hooks.db_joined()
-        self.assertEqual(context.exception.message,
-                         'Attempting to associate a mysql database when there '
-                         'is already associated a postgresql one')
-
-    def test_postgresql_db_joined(self):
-        self.unit_get.return_value = 'myhostname'
-        self.is_relation_made.return_value = False
-        self._call_hook('pgsql-db-relation-joined')
-        self.relation_set.assert_called_with(
-            database='nova',
-            relation_id=None
-        )
-
-    def test_postgresql_joined_with_db(self):
-        self.is_relation_made.return_value = True
-
-        with self.assertRaises(Exception) as context:
-            hooks.pgsql_db_joined()
-        self.assertEqual(context.exception.message,
-                         'Attempting to associate a postgresql database when'
-                         ' there is already associated a mysql one')
 
     def test_amqp_joined(self):
         self._call_hook('amqp-relation-joined')
@@ -325,19 +279,60 @@ class TestQuantumHooks(CharmTestCase):
         self._call_hook('amqp-nova-relation-changed')
         self.assertTrue(self.CONFIGS.write_all.called)
 
-    def test_shared_db_changed(self):
-        self._call_hook('shared-db-relation-changed')
-        self.assertTrue(self.CONFIGS.write_all.called)
-
-    def test_pgsql_db_changed(self):
-        self._call_hook('pgsql-db-relation-changed')
-        self.assertTrue(self.CONFIGS.write_all.called)
-
     def test_nm_changed(self):
-        self.relation_get.return_value = "cert"
+        def _relation_get(key):
+            data = {
+                'ca_cert': 'cert',
+                'restart_nonce': None,
+            }
+            return data.get(key)
+        self.relation_get.side_effect = _relation_get
         self._call_hook('quantum-network-service-relation-changed')
         self.assertTrue(self.CONFIGS.write_all.called)
         self.install_ca_cert.assert_called_with('cert')
+
+    def test_nm_changed_restart_nonce_changed(self):
+        def _relation_get(key):
+            data = {
+                'ca_cert': 'cert',
+                'restart_nonce': '1111111222222333333',
+            }
+            return data.get(key)
+        self.relation_get.side_effect = _relation_get
+        self.is_unit_paused_set.return_value = False
+        kv_mock = MagicMock()
+        self.kv.return_value = kv_mock
+        kv_mock.get.return_value = ('22222233333344444')
+        self._call_hook('quantum-network-service-relation-changed')
+        self.assertTrue(self.CONFIGS.write_all.called)
+        self.install_ca_cert.assert_called_with('cert')
+        self.service_restart.assert_called_with('nova-api-metadata')
+        kv_mock.get.assert_called_with('restart_nonce',
+                                       '1111111222222333333')
+        kv_mock.set.assert_called_with('restart_nonce',
+                                       '1111111222222333333')
+        self.assertTrue(kv_mock.flush.called)
+
+    def test_nm_changed_restart_nonce_nochange(self):
+        def _relation_get(key):
+            data = {
+                'ca_cert': 'cert',
+                'restart_nonce': '1111111222222333333',
+            }
+            return data.get(key)
+        self.relation_get.side_effect = _relation_get
+        self.is_unit_paused_set.return_value = False
+        kv_mock = MagicMock()
+        self.kv.return_value = kv_mock
+        kv_mock.get.return_value = ('1111111222222333333')
+        self._call_hook('quantum-network-service-relation-changed')
+        self.assertTrue(self.CONFIGS.write_all.called)
+        self.install_ca_cert.assert_called_with('cert')
+        self.assertFalse(self.service_restart.called)
+        kv_mock.get.assert_called_with('restart_nonce',
+                                       '1111111222222333333')
+        self.assertFalse(kv_mock.set.called)
+        self.assertFalse(kv_mock.flush.called)
 
     def test_neutron_plugin_changed(self):
         self.use_l3ha.return_value = True

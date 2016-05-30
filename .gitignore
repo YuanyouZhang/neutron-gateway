@@ -1,0 +1,13 @@
+bin
+.coverage
+tags
+.tox
+.testrepository
+*.pyc
+*.sw[nop]
+*.pyc
+precise
+trusty
+wily
+xenial
+.unit-state.db
