@@ -70,7 +70,7 @@ from charmhelpers.contrib.openstack.context import (
 import charmhelpers.contrib.openstack.templating as templating
 from charmhelpers.contrib.openstack.neutron import headers_package
 from neutron_contexts import (
-    CORE_PLUGIN, OVS, NSX, N1KV, OVS_ODL,ONOS,
+    CORE_PLUGIN, OVS, NSX, N1KV, OVS_ODL, ONOS,
     NeutronGatewayContext,
     L3AgentContext,
 )
@@ -252,6 +252,9 @@ def get_packages():
             # Switch out to actual ovs agent package
             packages.remove('neutron-plugin-openvswitch-agent')
             packages.append('neutron-openvswitch-agent')
+    if plugin == 'onos':
+        if config('profile') == 'onos-sfc':
+            packages.remove('openvswitch-switch')
     packages.extend(determine_l3ha_packages())
 
     if git_install_requested():

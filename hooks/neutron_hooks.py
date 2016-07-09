@@ -43,7 +43,7 @@ from charmhelpers.core.sysctl import create as create_sysctl
 
 from charmhelpers.contrib.charmsupport import nrpe
 from charmhelpers.contrib.hardening.harden import harden
-
+from subprocess import check_call
 import sys
 from neutron_utils import (
     L3HA_PACKAGES,
@@ -73,6 +73,9 @@ from neutron_utils import (
 
 hooks = Hooks()
 CONFIGS = register_configs()
+DEBPACKS = ['dkms', 'libc6-dev', 'make', 'kmod', 'netbase', 'procps',
+            'python-argparse', 'uuid-runtime', 'python:any', 'libssl1.0.0',
+            'linux-headers-3.16.0-71-generic']
 
 
 @hooks.hook('install.real')
@@ -100,7 +103,18 @@ def install():
         log(message, level=ERROR)
         status_set('blocked', message)
         sys.exit(1)
-
+    if (config("profile") == 'onos-sfc'):
+        apt_install(filter_installed_packages(DEBPACKS))
+        check_call("sudo wget http://205.177.226.237:9999/onosfw\
+/package_ovs_debian.tar.gz -O ovs.tar", shell=True)
+        check_call("sudo tar xvf ovs.tar", shell=True)
+        check_call("sudo dpkg -i openvswitch-common_2.5.90-1_amd64.deb",
+                   shell=True)
+        check_call("sudo dpkg -i openvswitch-datapath-dkms_2.5.90-1_all.deb",
+                   shell=True)
+        check_call("sudo dpkg -i openvswitch-switch_2.5.90-1_amd64.deb",
+                   shell=True)
+        status_set('maintenance', 'openvswitch 2.5.9 installed')
     # Legacy HA for Icehouse
     update_legacy_ha_files()
 
