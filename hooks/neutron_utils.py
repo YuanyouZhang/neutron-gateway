@@ -73,7 +73,7 @@ from charmhelpers.contrib.openstack.context import (
 import charmhelpers.contrib.openstack.templating as templating
 from charmhelpers.contrib.openstack.neutron import headers_package
 from neutron_contexts import (
-    CORE_PLUGIN, OVS, NSX, N1KV, OVS_ODL,
+    CORE_PLUGIN, OVS, NSX, N1KV, OVS_ODL, ONOS,
     NeutronGatewayContext,
     L3AgentContext,
 )
@@ -142,6 +142,13 @@ GATEWAY_PKGS = {
         "neutron-metering-agent",
         "neutron-lbaas-agent",
     ],
+    ONOS: [
+        "openvswitch-switch",
+        "neutron-dhcp-agent",
+        "nova-api-metadata",
+        "neutron-metering-agent",
+        "neutron-lbaas-agent",
+    ],
 }
 
 EARLY_PACKAGES = {
@@ -149,6 +156,7 @@ EARLY_PACKAGES = {
     NSX: [],
     N1KV: [],
     OVS_ODL: [],
+    ONOS: [],
 }
 
 LEGACY_HA_TEMPLATE_FILES = 'files'
@@ -249,6 +257,9 @@ def get_packages():
             # Switch out to actual ovs agent package
             packages.remove('neutron-plugin-openvswitch-agent')
             packages.append('neutron-openvswitch-agent')
+    if plugin == 'onos':
+        if config('profile') == 'onos-sfc':
+            packages.remove('openvswitch-switch')
     packages.extend(determine_l3ha_packages())
 
     if git_install_requested():
@@ -438,6 +449,48 @@ NEUTRON_OVS_ODL_CONFIG_FILES = {
 }
 NEUTRON_OVS_ODL_CONFIG_FILES.update(NEUTRON_SHARED_CONFIG_FILES)
 
+NEUTRON_ONOS_CONFIG_FILES = {
+    NEUTRON_CONF: {
+        'hook_contexts': [context.AMQPContext(ssl_dir=NEUTRON_CONF_DIR),
+                          NeutronGatewayContext(),
+                          SyslogContext(),
+                          context.ZeroMQContext(),
+                          context.NotificationDriverContext()],
+        'services': ['neutron-dhcp-agent',
+                     'neutron-metadata-agent',
+                     'neutron-plugin-metering-agent',
+                     'neutron-metering-agent',
+                     'neutron-lbaas-agent',
+                     'neutron-vpn-agent']
+    },
+    NEUTRON_METERING_AGENT_CONF: {
+        'hook_contexts': [NeutronGatewayContext()],
+        'services': ['neutron-plugin-metering-agent',
+                     'neutron-metering-agent']
+    },
+    NEUTRON_LBAAS_AGENT_CONF: {
+        'hook_contexts': [NeutronGatewayContext()],
+        'services': ['neutron-lbaas-agent']
+    },
+    NEUTRON_VPNAAS_AGENT_CONF: {
+        'hook_contexts': [NeutronGatewayContext()],
+        'services': ['neutron-vpn-agent']
+    },
+    NEUTRON_FWAAS_CONF: {
+        'hook_contexts': [NeutronGatewayContext()],
+        'services': ['neutron-vpn-agent']
+    },
+    EXT_PORT_CONF: {
+        'hook_contexts': [ExternalPortContext()],
+        'services': ['ext-port']
+    },
+    PHY_NIC_MTU_CONF: {
+        'hook_contexts': [PhyNICMTUContext()],
+        'services': ['os-charm-phy-nic-mtu']
+    }
+}
+NEUTRON_ONOS_CONFIG_FILES.update(NEUTRON_SHARED_CONFIG_FILES)
+
 NEUTRON_NSX_CONFIG_FILES = {
     NEUTRON_CONF: {
         'hook_contexts': [context.AMQPContext(ssl_dir=NEUTRON_CONF_DIR),
@@ -473,6 +526,7 @@ CONFIG_FILES = {
     OVS: NEUTRON_OVS_CONFIG_FILES,
     N1KV: NEUTRON_N1KV_CONFIG_FILES,
     OVS_ODL: NEUTRON_OVS_ODL_CONFIG_FILES
+    ONOS: NEUTRON_ONOS_CONFIG_FILES
 }
 
 SERVICE_RENAMES = {
@@ -732,10 +786,11 @@ def do_openstack_upgrade(configs):
 
 
 def configure_ovs():
-    if config('plugin') in [OVS, OVS_ODL]:
+    if config('plugin') in [OVS, OVS_ODL, ONOS]:
         if not service_running('openvswitch-switch'):
             full_restart()
-        add_bridge(INT_BRIDGE)
+        if config('plugin') in [OVS, OVS_ODL]:
+            add_bridge(INT_BRIDGE)
         add_bridge(EXT_BRIDGE)
         ext_port_ctx = ExternalPortContext()()
         if ext_port_ctx and ext_port_ctx['ext_port']:
