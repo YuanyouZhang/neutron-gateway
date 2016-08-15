@@ -8,10 +8,12 @@ from charmhelpers.core.host import (
     add_user_to_group,
     lsb_release,
     mkdir,
+    service,
     service_running,
     service_stop,
     service_restart,
     write_file,
+    init_is_systemd,
 )
 from charmhelpers.core.hookenv import (
     charm_dir,
@@ -24,7 +26,6 @@ from charmhelpers.core.hookenv import (
     unit_private_ip,
     is_relation_made,
     relation_ids,
-    status_get,
 )
 from charmhelpers.core.templating import render
 from charmhelpers.fetch import (
@@ -43,13 +44,15 @@ from charmhelpers.contrib.hahelpers.cluster import (
 from charmhelpers.contrib.openstack.utils import (
     configure_installation_source,
     get_os_codename_install_source,
-    git_install_requested,
     git_clone_and_install,
-    git_src_dir,
+    git_default_repos,
+    git_generate_systemd_init_files,
+    git_install_requested,
     git_pip_venv_dir,
+    git_src_dir,
     get_hostname,
-    set_os_workload_status,
     make_assess_status_func,
+    os_release,
     pause_unit,
     resume_unit,
 )
@@ -70,7 +73,7 @@ from charmhelpers.contrib.openstack.context import (
 import charmhelpers.contrib.openstack.templating as templating
 from charmhelpers.contrib.openstack.neutron import headers_package
 from neutron_contexts import (
-    CORE_PLUGIN, OVS, NSX, N1KV, OVS_ODL, ONOS,
+    CORE_PLUGIN, OVS, NSX, N1KV, OVS_ODL,
     NeutronGatewayContext,
     L3AgentContext,
 )
@@ -139,13 +142,6 @@ GATEWAY_PKGS = {
         "neutron-metering-agent",
         "neutron-lbaas-agent",
     ],
-    ONOS: [
-        "openvswitch-switch",
-        "neutron-dhcp-agent",
-        "nova-api-metadata",
-        "neutron-metering-agent",
-        "neutron-lbaas-agent",
-    ],
 }
 
 EARLY_PACKAGES = {
@@ -153,7 +149,6 @@ EARLY_PACKAGES = {
     NSX: [],
     N1KV: [],
     OVS_ODL: [],
-    ONOS: [],
 }
 
 LEGACY_HA_TEMPLATE_FILES = 'files'
@@ -180,6 +175,7 @@ BASE_GIT_PACKAGES = [
     'libxml2-dev',
     'libxslt1-dev',
     'libyaml-dev',
+    'openstack-pkg-tools',
     'python-dev',
     'python-pip',
     'python-setuptools',
@@ -198,6 +194,7 @@ GIT_PACKAGE_BLACKLIST = [
     'neutron-plugin-cisco',
     'neutron-plugin-metering-agent',
     'neutron-plugin-openvswitch-agent',
+    'neutron-openvswitch-agent',
     'neutron-vpn-agent',
     'python-neutron-fwaas',
     'python-oslo.config',
@@ -252,9 +249,6 @@ def get_packages():
             # Switch out to actual ovs agent package
             packages.remove('neutron-plugin-openvswitch-agent')
             packages.append('neutron-openvswitch-agent')
-    if plugin == 'onos':
-        if config('profile') == 'onos-sfc':
-            packages.remove('openvswitch-switch')
     packages.extend(determine_l3ha_packages())
 
     if git_install_requested():
@@ -306,6 +300,7 @@ NOVA_CONFIG_FILES = {
         'hook_contexts': [NetworkServiceContext(),
                           NeutronGatewayContext(),
                           SyslogContext(),
+                          context.WorkerConfigContext(),
                           context.ZeroMQContext(),
                           context.NotificationDriverContext()],
         'services': ['nova-api-metadata']
@@ -323,6 +318,7 @@ NEUTRON_SHARED_CONFIG_FILES = {
     },
     NEUTRON_METADATA_AGENT_CONF: {
         'hook_contexts': [NetworkServiceContext(),
+                          context.WorkerConfigContext(),
                           NeutronGatewayContext()],
         'services': ['neutron-metadata-agent']
     },
@@ -335,6 +331,7 @@ NEUTRON_OVS_CONFIG_FILES = {
                           NeutronGatewayContext(),
                           SyslogContext(),
                           context.ZeroMQContext(),
+                          context.WorkerConfigContext(),
                           context.NotificationDriverContext()],
         'services': ['neutron-l3-agent',
                      'neutron-dhcp-agent',
@@ -397,6 +394,7 @@ NEUTRON_OVS_ODL_CONFIG_FILES = {
                           NeutronGatewayContext(),
                           SyslogContext(),
                           context.ZeroMQContext(),
+                          context.WorkerConfigContext(),
                           context.NotificationDriverContext()],
         'services': ['neutron-l3-agent',
                      'neutron-dhcp-agent',
@@ -440,52 +438,11 @@ NEUTRON_OVS_ODL_CONFIG_FILES = {
 }
 NEUTRON_OVS_ODL_CONFIG_FILES.update(NEUTRON_SHARED_CONFIG_FILES)
 
-NEUTRON_ONOS_CONFIG_FILES = {
-    NEUTRON_CONF: {
-        'hook_contexts': [context.AMQPContext(ssl_dir=NEUTRON_CONF_DIR),
-                          NeutronGatewayContext(),
-                          SyslogContext(),
-                          context.ZeroMQContext(),
-                          context.NotificationDriverContext()],
-        'services': ['neutron-dhcp-agent',
-                     'neutron-metadata-agent',
-                     'neutron-plugin-metering-agent',
-                     'neutron-metering-agent',
-                     'neutron-lbaas-agent',
-                     'neutron-vpn-agent']
-    },
-    NEUTRON_METERING_AGENT_CONF: {
-        'hook_contexts': [NeutronGatewayContext()],
-        'services': ['neutron-plugin-metering-agent',
-                     'neutron-metering-agent']
-    },
-    NEUTRON_LBAAS_AGENT_CONF: {
-        'hook_contexts': [NeutronGatewayContext()],
-        'services': ['neutron-lbaas-agent']
-    },
-    NEUTRON_VPNAAS_AGENT_CONF: {
-        'hook_contexts': [NeutronGatewayContext()],
-        'services': ['neutron-vpn-agent']
-    },
-    NEUTRON_FWAAS_CONF: {
-        'hook_contexts': [NeutronGatewayContext()],
-        'services': ['neutron-vpn-agent']
-    },
-    EXT_PORT_CONF: {
-        'hook_contexts': [ExternalPortContext()],
-        'services': ['ext-port']
-    },
-    PHY_NIC_MTU_CONF: {
-        'hook_contexts': [PhyNICMTUContext()],
-        'services': ['os-charm-phy-nic-mtu']
-    }
-}
-NEUTRON_ONOS_CONFIG_FILES.update(NEUTRON_SHARED_CONFIG_FILES)
-
 NEUTRON_NSX_CONFIG_FILES = {
     NEUTRON_CONF: {
         'hook_contexts': [context.AMQPContext(ssl_dir=NEUTRON_CONF_DIR),
                           NeutronGatewayContext(),
+                          context.WorkerConfigContext(),
                           SyslogContext()],
         'services': ['neutron-dhcp-agent', 'neutron-metadata-agent']
     },
@@ -496,6 +453,7 @@ NEUTRON_N1KV_CONFIG_FILES = {
     NEUTRON_CONF: {
         'hook_contexts': [context.AMQPContext(ssl_dir=NEUTRON_CONF_DIR),
                           NeutronGatewayContext(),
+                          context.WorkerConfigContext(),
                           SyslogContext()],
         'services': ['neutron-l3-agent',
                      'neutron-dhcp-agent',
@@ -514,8 +472,7 @@ CONFIG_FILES = {
     NSX: NEUTRON_NSX_CONFIG_FILES,
     OVS: NEUTRON_OVS_CONFIG_FILES,
     N1KV: NEUTRON_N1KV_CONFIG_FILES,
-    OVS_ODL: NEUTRON_OVS_ODL_CONFIG_FILES,
-    ONOS: NEUTRON_ONOS_CONFIG_FILES
+    OVS_ODL: NEUTRON_OVS_ODL_CONFIG_FILES
 }
 
 SERVICE_RENAMES = {
@@ -526,6 +483,25 @@ SERVICE_RENAMES = {
         'neutron-plugin-openvswitch-agent': 'neutron-openvswitch-agent',
     },
 }
+
+
+# Override file for systemd
+SYSTEMD_NOVA_OVERRIDE = (
+    '/etc/systemd/system/nova-api-metadata.service.d/override.conf'
+)
+
+
+def install_systemd_override():
+    '''
+    Install systemd override files for nova-api-metadata
+    and reload systemd daemon if required.
+    '''
+    if init_is_systemd() and not os.path.exists(SYSTEMD_NOVA_OVERRIDE):
+        mkdir(os.path.dirname(SYSTEMD_NOVA_OVERRIDE))
+        shutil.copy(os.path.join('files',
+                                 os.path.basename(SYSTEMD_NOVA_OVERRIDE)),
+                    SYSTEMD_NOVA_OVERRIDE)
+        subprocess.check_call(['systemctl', 'daemon-reload'])
 
 
 def remap_service(service_name):
@@ -756,11 +732,10 @@ def do_openstack_upgrade(configs):
 
 
 def configure_ovs():
-    if config('plugin') in [OVS, OVS_ODL, ONOS]:
+    if config('plugin') in [OVS, OVS_ODL]:
         if not service_running('openvswitch-switch'):
             full_restart()
-        if config('plugin') in [OVS, OVS_ODL]:
-            add_bridge(INT_BRIDGE)
+        add_bridge(INT_BRIDGE)
         add_bridge(EXT_BRIDGE)
         ext_port_ctx = ExternalPortContext()()
         if ext_port_ctx and ext_port_ctx['ext_port']:
@@ -904,6 +879,7 @@ def git_install(projects_yaml):
     """Perform setup, and install git repos specified in yaml parameter."""
     if git_install_requested():
         git_pre_install()
+        projects_yaml = git_default_repos(projects_yaml)
         git_clone_and_install(projects_yaml, core_project='neutron')
         git_post_install(projects_yaml)
 
@@ -918,6 +894,8 @@ def git_pre_install():
         '/var/lib/neutron',
         '/var/lib/neutron/lock',
         '/var/log/neutron',
+        '/var/lib/nova',
+        '/var/log/nova',
     ]
 
     logs = [
@@ -944,6 +922,11 @@ def git_pre_install():
     adduser('neutron', shell='/bin/bash', system_user=True)
     add_group('neutron', system_group=True)
     add_user_to_group('neutron', 'neutron')
+
+    adduser('nova', shell='/bin/bash', system_user=True)
+    subprocess.check_call(['usermod', '--home', '/var/lib/nova', 'nova'])
+    add_group('nova', system_group=True)
+    add_user_to_group('nova', 'nova')
 
     for d in dirs:
         mkdir(d, owner='neutron', group='neutron', perms=0755, force=False)
@@ -985,6 +968,8 @@ def git_post_install(projects_yaml):
 
     render('git/neutron_sudoers',
            '/etc/sudoers.d/neutron_sudoers', {}, perms=0o440)
+    render('git/nova_sudoers',
+           '/etc/sudoers.d/nova_sudoers', {}, perms=0o440)
     render('git/cron.d/neutron-dhcp-agent-netns-cleanup',
            '/etc/cron.d/neutron-dhcp-agent-netns-cleanup', {}, perms=0o755)
     render('git/cron.d/neutron-l3-agent-netns-cleanup',
@@ -992,275 +977,356 @@ def git_post_install(projects_yaml):
     render('git/cron.d/neutron-lbaas-agent-netns-cleanup',
            '/etc/cron.d/neutron-lbaas-agent-netns-cleanup', {}, perms=0o755)
 
-    service_name = 'quantum-gateway'
-    user_name = 'neutron'
     bin_dir = os.path.join(git_pip_venv_dir(projects_yaml), 'bin')
-    neutron_api_context = {
-        'service_description': 'Neutron API server',
-        'service_name': service_name,
-        'process_name': 'neutron-server',
-        'executable_name': os.path.join(bin_dir, 'neutron-server'),
-    }
-    neutron_dhcp_agent_context = {
-        'service_description': 'Neutron DHCP Agent',
-        'service_name': service_name,
-        'process_name': 'neutron-dhcp-agent',
-        'executable_name': os.path.join(bin_dir, 'neutron-dhcp-agent'),
-        'config_files': ['/etc/neutron/neutron.conf',
-                         '/etc/neutron/dhcp_agent.ini'],
-        'log_file': '/var/log/neutron/dhcp-agent.log',
-    }
-    neutron_l3_agent_context = {
-        'service_description': 'Neutron L3 Agent',
-        'service_name': service_name,
-        'process_name': 'neutron-l3-agent',
-        'executable_name': os.path.join(bin_dir, 'neutron-l3-agent'),
-        'config_files': ['/etc/neutron/neutron.conf',
-                         '/etc/neutron/l3_agent.ini',
-                         '/etc/neutron/fwaas_driver.ini'],
-        'log_file': '/var/log/neutron/l3-agent.log',
-    }
-    neutron_lbaas_agent_context = {
-        'service_description': 'Neutron LBaaS Agent',
-        'service_name': service_name,
-        'user_name': user_name,
-        'start_dir': '/var/lib/neutron',
-        'process_name': 'neutron-lbaas-agent',
-        'executable_name': os.path.join(bin_dir, 'neutron-lbaas-agent'),
-        'config_files': ['/etc/neutron/neutron.conf',
-                         '/etc/neutron/lbaas_agent.ini'],
-        'log_file': '/var/log/neutron/lbaas-agent.log',
-    }
-    neutron_metadata_agent_context = {
-        'service_description': 'Neutron Metadata Agent',
-        'service_name': service_name,
-        'user_name': user_name,
-        'start_dir': '/var/lib/neutron',
-        'process_name': 'neutron-metadata-agent',
-        'executable_name': os.path.join(bin_dir, 'neutron-metadata-agent'),
-        'config_files': ['/etc/neutron/neutron.conf',
-                         '/etc/neutron/metadata_agent.ini'],
-        'log_file': '/var/log/neutron/metadata-agent.log',
-    }
-    neutron_metering_agent_context = {
-        'service_description': 'Neutron Metering Agent',
-        'service_name': service_name,
-        'user_name': user_name,
-        'start_dir': '/var/lib/neutron',
-        'process_name': 'neutron-metering-agent',
-        'executable_name': os.path.join(bin_dir, 'neutron-metering-agent'),
-        'config_files': ['/etc/neutron/neutron.conf',
-                         '/etc/neutron/metering_agent.ini'],
-        'log_file': '/var/log/neutron/metering-agent.log',
-    }
-    neutron_ovs_cleanup_context = {
-        'service_description': 'Neutron OVS cleanup',
-        'service_name': service_name,
-        'user_name': user_name,
-        'start_dir': '/var/lib/neutron',
-        'process_name': 'neutron-ovs-cleanup',
-        'executable_name': os.path.join(bin_dir, 'neutron-ovs-cleanup'),
-        'config_file': '/etc/neutron/neutron.conf',
-        'log_file': '/var/log/neutron/ovs-cleanup.log',
-    }
-    neutron_plugin_bigswitch_context = {
-        'service_description': 'Neutron BigSwitch Plugin Agent',
-        'service_name': service_name,
-        'user_name': user_name,
-        'start_dir': '/var/lib/neutron',
-        'process_name': 'neutron-restproxy-agent',
-        'executable_name': os.path.join(bin_dir, 'neutron-restproxy-agent'),
-        'config_files': ['/etc/neutron/neutron.conf',
-                         '/etc/neutron/plugins/bigswitch/restproxy.ini'],
-        'log_file': '/var/log/neutron/bigswitch-agent.log',
-    }
-    neutron_plugin_ibm_context = {
-        'service_description': 'Neutron IBM SDN Plugin Agent',
-        'service_name': service_name,
-        'user_name': user_name,
-        'start_dir': '/var/lib/neutron',
-        'process_name': 'neutron-ibm-agent',
-        'executable_name': os.path.join(bin_dir, 'neutron-ibm-agent'),
-        'config_files': ['/etc/neutron/neutron.conf',
-                         '/etc/neutron/plugins/ibm/sdnve_neutron_plugin.ini'],
-        'log_file': '/var/log/neutron/ibm-agent.log',
-    }
-    neutron_plugin_linuxbridge_context = {
-        'service_description': 'Neutron Linux Bridge Plugin Agent',
-        'service_name': service_name,
-        'user_name': user_name,
-        'start_dir': '/var/lib/neutron',
-        'process_name': 'neutron-linuxbridge-agent',
-        'executable_name': os.path.join(bin_dir, 'neutron-linuxbridge-agent'),
-        'config_files': ['/etc/neutron/neutron.conf',
-                         '/etc/neutron/plugins/ml2/ml2_conf.ini'],
-        'log_file': '/var/log/neutron/linuxbridge-agent.log',
-    }
-    neutron_plugin_mlnx_context = {
-        'service_description': 'Neutron MLNX Plugin Agent',
-        'service_name': service_name,
-        'user_name': user_name,
-        'start_dir': '/var/lib/neutron',
-        'process_name': 'neutron-mlnx-agent',
-        'executable_name': os.path.join(bin_dir, 'neutron-mlnx-agent'),
-        'config_files': ['/etc/neutron/neutron.conf',
-                         '/etc/neutron/plugins/mlnx/mlnx_conf.ini'],
-        'log_file': '/var/log/neutron/mlnx-agent.log',
-    }
-    neutron_plugin_nec_context = {
-        'service_description': 'Neutron NEC Plugin Agent',
-        'service_name': service_name,
-        'start_dir': '/var/lib/neutron',
-        'process_name': 'neutron-nec-agent',
-        'executable_name': os.path.join(bin_dir, 'neutron-nec-agent'),
-        'config_files': ['/etc/neutron/neutron.conf',
-                         '/etc/neutron/plugins/nec/nec.ini'],
-        'log_file': '/var/log/neutron/nec-agent.log',
-    }
-    neutron_plugin_oneconvergence_context = {
-        'service_description': 'Neutron One Convergence Plugin Agent',
-        'service_name': service_name,
-        'user_name': user_name,
-        'start_dir': '/var/lib/neutron',
-        'process_name': 'neutron-nvsd-agent',
-        'executable_name': os.path.join(bin_dir, 'neutron-nvsd-agent'),
-        'config_files': ['/etc/neutron/neutron.conf',
-                         '/etc/neutron/plugins/oneconvergence/nvsdplugin.ini'],
-        'log_file': '/var/log/neutron/nvsd-agent.log',
-    }
-    neutron_plugin_openflow_context = {
-        'service_description': 'Neutron OpenFlow Plugin Agent',
-        'service_name': service_name,
-        'user_name': user_name,
-        'start_dir': '/var/lib/neutron',
-        'process_name': 'neutron-ofagent-agent',
-        'executable_name': os.path.join(bin_dir, 'neutron-ofagent-agent'),
-        'config_files': ['/etc/neutron/neutron.conf',
-                         '/etc/neutron/plugins/ml2/ml2_conf_ofa.ini'],
-        'log_file': '/var/log/neutron/openflow-agent.log',
-    }
-    neutron_plugin_openvswitch_context = {
-        'service_description': 'Neutron OpenvSwitch Plugin Agent',
-        'service_name': service_name,
-        'user_name': user_name,
-        'start_dir': '/var/lib/neutron',
-        'process_name': 'neutron-openvswitch-agent',
-        'executable_name': os.path.join(bin_dir, 'neutron-openvswitch-agent'),
-        'config_files': ['/etc/neutron/neutron.conf',
-                         '/etc/neutron/plugins/ml2/ml2_conf.ini'],
-        'log_file': '/var/log/neutron/openvswitch-agent.log',
-    }
-    neutron_plugin_ryu_context = {
-        'service_description': 'Neutron RYU Plugin Agent',
-        'service_name': service_name,
-        'user_name': user_name,
-        'start_dir': '/var/lib/neutron',
-        'process_name': 'neutron-ryu-agent',
-        'executable_name': os.path.join(bin_dir, 'neutron-ryu-agent'),
-        'config_files': ['/etc/neutron/neutron.conf',
-                         '/etc/neutron/plugins/ryu/ryu.ini'],
-        'log_file': '/var/log/neutron/ryu-agent.log',
-    }
-    neutron_plugin_sriov_context = {
-        'service_description': 'Neutron SRIOV SDN Plugin Agent',
-        'service_name': service_name,
-        'user_name': user_name,
-        'start_dir': '/var/lib/neutron',
-        'process_name': 'neutron-sriov-nic-agent',
-        'executable_name': os.path.join(bin_dir, 'neutron-sriov-nic-agent'),
-        'config_files': ['/etc/neutron/neutron.conf',
-                         '/etc/neutron/plugins/ml2/ml2_conf_sriov'],
-        'log_file': '/var/log/neutron/sriov-agent.log',
-    }
-    neutron_vpn_agent_context = {
-        'service_description': 'Neutron VPN Agent',
-        'service_name': service_name,
-        'process_name': 'neutron-vpn-agent',
-        'executable_name': os.path.join(bin_dir, 'neutron-vpn-agent'),
-        'config_files': ['/etc/neutron/neutron.conf',
-                         '/etc/neutron/vpn_agent.ini',
-                         '/etc/neutron/l3_agent.ini',
-                         '/etc/neutron/fwaas_driver.ini'],
-        'log_file': '/var/log/neutron/vpn_agent.log',
-    }
+    # Use systemd init units/scripts from ubuntu wily onward
+    if lsb_release()['DISTRIB_RELEASE'] >= '15.10':
+        templates_dir = os.path.join(charm_dir(), 'templates/git')
+        daemons = ['neutron-dhcp-agent', 'neutron-l3-agent',
+                   'neutron-lbaas-agent', 'neutron-lbaasv2-agent',
+                   'neutron-linuxbridge-agent', 'neutron-linuxbridge-cleanup',
+                   'neutron-macvtap-agent', 'neutron-metadata-agent',
+                   'neutron-metering-agent', 'neutron-openvswitch-agent',
+                   'neutron-ovs-cleanup', 'neutron-server',
+                   'neutron-sriov-nic-agent', 'neutron-vpn-agent',
+                   'nova-api-metadata']
+        for daemon in daemons:
+            neutron_context = {
+                'daemon_path': os.path.join(bin_dir, daemon),
+            }
+            filename = daemon
+            if daemon == 'neutron-sriov-nic-agent':
+                filename = 'neutron-sriov-agent'
+            elif daemon == 'neutron-openvswitch-agent':
+                if os_release('neutron-common') < 'mitaka':
+                    filename = 'neutron-plugin-openvswitch-agent'
+            template_file = 'git/{}.init.in.template'.format(filename)
+            init_in_file = '{}.init.in'.format(filename)
+            render(template_file, os.path.join(templates_dir, init_in_file),
+                   neutron_context, perms=0o644)
+        git_generate_systemd_init_files(templates_dir)
 
-    # NOTE(coreycb): Needs systemd support
-    templates_dir = 'hooks/charmhelpers/contrib/openstack/templates'
-    templates_dir = os.path.join(charm_dir(), templates_dir)
-    render('git/upstart/neutron-agent.upstart',
-           '/etc/init/neutron-dhcp-agent.conf',
-           neutron_dhcp_agent_context, perms=0o644)
-    render('git/upstart/neutron-agent.upstart',
-           '/etc/init/neutron-l3-agent.conf',
-           neutron_l3_agent_context, perms=0o644)
-    render('git.upstart',
-           '/etc/init/neutron-lbaas-agent.conf',
-           neutron_lbaas_agent_context, perms=0o644,
-           templates_dir=templates_dir)
-    render('git.upstart',
-           '/etc/init/neutron-metadata-agent.conf',
-           neutron_metadata_agent_context, perms=0o644,
-           templates_dir=templates_dir)
-    render('git.upstart',
-           '/etc/init/neutron-metering-agent.conf',
-           neutron_metering_agent_context, perms=0o644,
-           templates_dir=templates_dir)
-    render('git.upstart',
-           '/etc/init/neutron-ovs-cleanup.conf',
-           neutron_ovs_cleanup_context, perms=0o644,
-           templates_dir=templates_dir)
-    render('git.upstart',
-           '/etc/init/neutron-plugin-bigswitch-agent.conf',
-           neutron_plugin_bigswitch_context, perms=0o644,
-           templates_dir=templates_dir)
-    render('git.upstart',
-           '/etc/init/neutron-plugin-ibm-agent.conf',
-           neutron_plugin_ibm_context, perms=0o644,
-           templates_dir=templates_dir)
-    render('git.upstart',
-           '/etc/init/neutron-plugin-linuxbridge-agent.conf',
-           neutron_plugin_linuxbridge_context, perms=0o644,
-           templates_dir=templates_dir)
-    render('git.upstart',
-           '/etc/init/neutron-plugin-mlnx-agent.conf',
-           neutron_plugin_mlnx_context, perms=0o644,
-           templates_dir=templates_dir)
-    render('git.upstart',
-           '/etc/init/neutron-plugin-nec-agent.conf',
-           neutron_plugin_nec_context, perms=0o644,
-           templates_dir=templates_dir)
-    render('git.upstart',
-           '/etc/init/neutron-plugin-oneconvergence-agent.conf',
-           neutron_plugin_oneconvergence_context, perms=0o644,
-           templates_dir=templates_dir)
-    render('git.upstart',
-           '/etc/init/neutron-plugin-openflow-agent.conf',
-           neutron_plugin_openflow_context, perms=0o644,
-           templates_dir=templates_dir)
-    render('git.upstart',
-           '/etc/init/neutron-plugin-openvswitch-agent.conf',
-           neutron_plugin_openvswitch_context, perms=0o644,
-           templates_dir=templates_dir)
-    render('git.upstart',
-           '/etc/init/neutron-plugin-ryu-agent.conf',
-           neutron_plugin_ryu_context, perms=0o644,
-           templates_dir=templates_dir)
-    render('git.upstart',
-           '/etc/init/neutron-plugin-sriov-agent.conf',
-           neutron_plugin_sriov_context, perms=0o644,
-           templates_dir=templates_dir)
-    render('git/upstart/neutron-server.upstart',
-           '/etc/init/neutron-server.conf',
-           neutron_api_context, perms=0o644)
-    render('git/upstart/neutron-agent.upstart',
-           '/etc/init/neutron-vpn-agent.conf',
-           neutron_vpn_agent_context, perms=0o644)
+        for daemon in daemons:
+            filename = daemon
+            if daemon == 'neutron-openvswitch-agent':
+                if os_release('neutron-common') < 'mitaka':
+                    filename = 'neutron-plugin-openvswitch-agent'
+                service('enable', filename)
+    else:
+        service_name = 'quantum-gateway'
+        user_name = 'neutron'
+        neutron_api_context = {
+            'service_description': 'Neutron API server',
+            'service_name': service_name,
+            'process_name': 'neutron-server',
+            'executable_name': os.path.join(bin_dir, 'neutron-server'),
+        }
+        neutron_dhcp_agent_context = {
+            'service_description': 'Neutron DHCP Agent',
+            'service_name': service_name,
+            'process_name': 'neutron-dhcp-agent',
+            'executable_name': os.path.join(bin_dir, 'neutron-dhcp-agent'),
+            'config_files': ['/etc/neutron/neutron.conf',
+                             '/etc/neutron/dhcp_agent.ini'],
+            'log_file': '/var/log/neutron/dhcp-agent.log',
+        }
+        neutron_l3_agent_context = {
+            'service_description': 'Neutron L3 Agent',
+            'service_name': service_name,
+            'process_name': 'neutron-l3-agent',
+            'executable_name': os.path.join(bin_dir, 'neutron-l3-agent'),
+            'config_files': ['/etc/neutron/neutron.conf',
+                             '/etc/neutron/l3_agent.ini',
+                             '/etc/neutron/fwaas_driver.ini'],
+            'log_file': '/var/log/neutron/l3-agent.log',
+        }
+        neutron_lbaas_agent_context = {
+            'service_description': 'Neutron LBaaS Agent',
+            'service_name': service_name,
+            'user_name': user_name,
+            'start_dir': '/var/lib/neutron',
+            'process_name': 'neutron-lbaas-agent',
+            'executable_name': os.path.join(bin_dir, 'neutron-lbaas-agent'),
+            'config_files': ['/etc/neutron/neutron.conf',
+                             '/etc/neutron/lbaas_agent.ini'],
+            'log_file': '/var/log/neutron/lbaas-agent.log',
+        }
+        neutron_metadata_agent_context = {
+            'service_description': 'Neutron Metadata Agent',
+            'service_name': service_name,
+            'user_name': user_name,
+            'start_dir': '/var/lib/neutron',
+            'process_name': 'neutron-metadata-agent',
+            'executable_name': os.path.join(bin_dir, 'neutron-metadata-agent'),
+            'config_files': ['/etc/neutron/neutron.conf',
+                             '/etc/neutron/metadata_agent.ini'],
+            'log_file': '/var/log/neutron/metadata-agent.log',
+        }
+        neutron_metering_agent_context = {
+            'service_description': 'Neutron Metering Agent',
+            'service_name': service_name,
+            'user_name': user_name,
+            'start_dir': '/var/lib/neutron',
+            'process_name': 'neutron-metering-agent',
+            'executable_name': os.path.join(bin_dir, 'neutron-metering-agent'),
+            'config_files': ['/etc/neutron/neutron.conf',
+                             '/etc/neutron/metering_agent.ini'],
+            'log_file': '/var/log/neutron/metering-agent.log',
+        }
+        neutron_ovs_cleanup_context = {
+            'service_description': 'Neutron OVS cleanup',
+            'service_name': service_name,
+            'user_name': user_name,
+            'start_dir': '/var/lib/neutron',
+            'process_name': 'neutron-ovs-cleanup',
+            'executable_name': os.path.join(bin_dir, 'neutron-ovs-cleanup'),
+            'config_file': '/etc/neutron/neutron.conf',
+            'log_file': '/var/log/neutron/ovs-cleanup.log',
+        }
+        neutron_plugin_bigswitch_context = {
+            'service_description': 'Neutron BigSwitch Plugin Agent',
+            'service_name': service_name,
+            'user_name': user_name,
+            'start_dir': '/var/lib/neutron',
+            'process_name': 'neutron-restproxy-agent',
+            'executable_name': os.path.join(bin_dir,
+                                            'neutron-restproxy-agent'),
+            'config_files': ['/etc/neutron/neutron.conf',
+                             '/etc/neutron/plugins/bigswitch/restproxy.ini'],
+            'log_file': '/var/log/neutron/bigswitch-agent.log',
+        }
+        neutron_plugin_ibm_context = {
+            'service_description': 'Neutron IBM SDN Plugin Agent',
+            'service_name': service_name,
+            'user_name': user_name,
+            'start_dir': '/var/lib/neutron',
+            'process_name': 'neutron-ibm-agent',
+            'executable_name': os.path.join(bin_dir, 'neutron-ibm-agent'),
+            'config_files':
+                ['/etc/neutron/neutron.conf',
+                 '/etc/neutron/plugins/ibm/sdnve_neutron_plugin.ini'],
+            'log_file': '/var/log/neutron/ibm-agent.log',
+        }
+        neutron_plugin_linuxbridge_context = {
+            'service_description': 'Neutron Linux Bridge Plugin Agent',
+            'service_name': service_name,
+            'user_name': user_name,
+            'start_dir': '/var/lib/neutron',
+            'process_name': 'neutron-linuxbridge-agent',
+            'executable_name': os.path.join(bin_dir,
+                                            'neutron-linuxbridge-agent'),
+            'config_files': ['/etc/neutron/neutron.conf',
+                             '/etc/neutron/plugins/ml2/ml2_conf.ini'],
+            'log_file': '/var/log/neutron/linuxbridge-agent.log',
+        }
+        neutron_plugin_mlnx_context = {
+            'service_description': 'Neutron MLNX Plugin Agent',
+            'service_name': service_name,
+            'user_name': user_name,
+            'start_dir': '/var/lib/neutron',
+            'process_name': 'neutron-mlnx-agent',
+            'executable_name': os.path.join(bin_dir, 'neutron-mlnx-agent'),
+            'config_files': ['/etc/neutron/neutron.conf',
+                             '/etc/neutron/plugins/mlnx/mlnx_conf.ini'],
+            'log_file': '/var/log/neutron/mlnx-agent.log',
+        }
+        neutron_plugin_nec_context = {
+            'service_description': 'Neutron NEC Plugin Agent',
+            'service_name': service_name,
+            'start_dir': '/var/lib/neutron',
+            'process_name': 'neutron-nec-agent',
+            'executable_name': os.path.join(bin_dir, 'neutron-nec-agent'),
+            'config_files': ['/etc/neutron/neutron.conf',
+                             '/etc/neutron/plugins/nec/nec.ini'],
+            'log_file': '/var/log/neutron/nec-agent.log',
+        }
+        neutron_plugin_oneconvergence_context = {
+            'service_description': 'Neutron One Convergence Plugin Agent',
+            'service_name': service_name,
+            'user_name': user_name,
+            'start_dir': '/var/lib/neutron',
+            'process_name': 'neutron-nvsd-agent',
+            'executable_name': os.path.join(bin_dir, 'neutron-nvsd-agent'),
+            'config_files':
+                ['/etc/neutron/neutron.conf',
+                 '/etc/neutron/plugins/oneconvergence/nvsdplugin.ini'],
+            'log_file': '/var/log/neutron/nvsd-agent.log',
+        }
+        neutron_plugin_openflow_context = {
+            'service_description': 'Neutron OpenFlow Plugin Agent',
+            'service_name': service_name,
+            'user_name': user_name,
+            'start_dir': '/var/lib/neutron',
+            'process_name': 'neutron-ofagent-agent',
+            'executable_name': os.path.join(bin_dir, 'neutron-ofagent-agent'),
+            'config_files': ['/etc/neutron/neutron.conf',
+                             '/etc/neutron/plugins/ml2/ml2_conf_ofa.ini'],
+            'log_file': '/var/log/neutron/openflow-agent.log',
+        }
+        neutron_plugin_openvswitch_context = {
+            'service_description': 'Neutron OpenvSwitch Plugin Agent',
+            'service_name': service_name,
+            'user_name': user_name,
+            'start_dir': '/var/lib/neutron',
+            'process_name': 'neutron-openvswitch-agent',
+            'executable_name': os.path.join(bin_dir,
+                                            'neutron-openvswitch-agent'),
+            'config_files': ['/etc/neutron/neutron.conf',
+                             '/etc/neutron/plugins/ml2/ml2_conf.ini'],
+            'log_file': '/var/log/neutron/openvswitch-agent.log',
+        }
+        neutron_plugin_ryu_context = {
+            'service_description': 'Neutron RYU Plugin Agent',
+            'service_name': service_name,
+            'user_name': user_name,
+            'start_dir': '/var/lib/neutron',
+            'process_name': 'neutron-ryu-agent',
+            'executable_name': os.path.join(bin_dir, 'neutron-ryu-agent'),
+            'config_files': ['/etc/neutron/neutron.conf',
+                             '/etc/neutron/plugins/ryu/ryu.ini'],
+            'log_file': '/var/log/neutron/ryu-agent.log',
+        }
+        neutron_plugin_sriov_context = {
+            'service_description': 'Neutron SRIOV SDN Plugin Agent',
+            'service_name': service_name,
+            'user_name': user_name,
+            'start_dir': '/var/lib/neutron',
+            'process_name': 'neutron-sriov-nic-agent',
+            'executable_name': os.path.join(bin_dir,
+                                            'neutron-sriov-nic-agent'),
+            'config_files': ['/etc/neutron/neutron.conf',
+                             '/etc/neutron/plugins/ml2/ml2_conf_sriov'],
+            'log_file': '/var/log/neutron/sriov-agent.log',
+        }
+        neutron_vpn_agent_context = {
+            'service_description': 'Neutron VPN Agent',
+            'service_name': service_name,
+            'process_name': 'neutron-vpn-agent',
+            'executable_name': os.path.join(bin_dir, 'neutron-vpn-agent'),
+            'config_files': ['/etc/neutron/neutron.conf',
+                             '/etc/neutron/vpn_agent.ini',
+                             '/etc/neutron/l3_agent.ini',
+                             '/etc/neutron/fwaas_driver.ini'],
+            'log_file': '/var/log/neutron/vpn_agent.log',
+        }
+        service_name = 'nova-compute'
+        nova_user = 'nova'
+        start_dir = '/var/lib/nova'
+        nova_conf = '/etc/nova/nova.conf'
+        nova_api_metadata_context = {
+            'service_description': 'Nova Metadata API server',
+            'service_name': service_name,
+            'user_name': nova_user,
+            'start_dir': start_dir,
+            'process_name': 'nova-api-metadata',
+            'executable_name': os.path.join(bin_dir, 'nova-api-metadata'),
+            'config_files': [nova_conf],
+        }
+
+        templates_dir = 'hooks/charmhelpers/contrib/openstack/templates'
+        templates_dir = os.path.join(charm_dir(), templates_dir)
+        render('git/upstart/neutron-agent.upstart',
+               '/etc/init/neutron-dhcp-agent.conf',
+               neutron_dhcp_agent_context, perms=0o644)
+        render('git/upstart/neutron-agent.upstart',
+               '/etc/init/neutron-l3-agent.conf',
+               neutron_l3_agent_context, perms=0o644)
+        render('git.upstart',
+               '/etc/init/neutron-lbaas-agent.conf',
+               neutron_lbaas_agent_context, perms=0o644,
+               templates_dir=templates_dir)
+        render('git.upstart',
+               '/etc/init/neutron-metadata-agent.conf',
+               neutron_metadata_agent_context, perms=0o644,
+               templates_dir=templates_dir)
+        render('git.upstart',
+               '/etc/init/neutron-metering-agent.conf',
+               neutron_metering_agent_context, perms=0o644,
+               templates_dir=templates_dir)
+        render('git.upstart',
+               '/etc/init/neutron-ovs-cleanup.conf',
+               neutron_ovs_cleanup_context, perms=0o644,
+               templates_dir=templates_dir)
+        render('git.upstart',
+               '/etc/init/neutron-plugin-bigswitch-agent.conf',
+               neutron_plugin_bigswitch_context, perms=0o644,
+               templates_dir=templates_dir)
+        render('git.upstart',
+               '/etc/init/neutron-plugin-ibm-agent.conf',
+               neutron_plugin_ibm_context, perms=0o644,
+               templates_dir=templates_dir)
+        render('git.upstart',
+               '/etc/init/neutron-plugin-linuxbridge-agent.conf',
+               neutron_plugin_linuxbridge_context, perms=0o644,
+               templates_dir=templates_dir)
+        render('git.upstart',
+               '/etc/init/neutron-plugin-mlnx-agent.conf',
+               neutron_plugin_mlnx_context, perms=0o644,
+               templates_dir=templates_dir)
+        render('git.upstart',
+               '/etc/init/neutron-plugin-nec-agent.conf',
+               neutron_plugin_nec_context, perms=0o644,
+               templates_dir=templates_dir)
+        render('git.upstart',
+               '/etc/init/neutron-plugin-oneconvergence-agent.conf',
+               neutron_plugin_oneconvergence_context, perms=0o644,
+               templates_dir=templates_dir)
+        render('git.upstart',
+               '/etc/init/neutron-plugin-openflow-agent.conf',
+               neutron_plugin_openflow_context, perms=0o644,
+               templates_dir=templates_dir)
+        if os_release('neutron-common') < 'mitaka':
+            render('git.upstart',
+                   '/etc/init/neutron-plugin-openvswitch-agent.conf',
+                   neutron_plugin_openvswitch_context, perms=0o644,
+                   templates_dir=templates_dir)
+        else:
+            render('git.upstart',
+                   '/etc/init/neutron-openvswitch-agent.conf',
+                   neutron_plugin_openvswitch_context, perms=0o644,
+                   templates_dir=templates_dir)
+        render('git.upstart',
+               '/etc/init/neutron-plugin-ryu-agent.conf',
+               neutron_plugin_ryu_context, perms=0o644,
+               templates_dir=templates_dir)
+        render('git.upstart',
+               '/etc/init/neutron-plugin-sriov-agent.conf',
+               neutron_plugin_sriov_context, perms=0o644,
+               templates_dir=templates_dir)
+        render('git/upstart/neutron-server.upstart',
+               '/etc/init/neutron-server.conf',
+               neutron_api_context, perms=0o644)
+        render('git/upstart/neutron-agent.upstart',
+               '/etc/init/neutron-vpn-agent.conf',
+               neutron_vpn_agent_context, perms=0o644)
+        render('git.upstart',
+               '/etc/init/nova-api-metadata.conf',
+               nova_api_metadata_context, perms=0o644,
+               templates_dir=templates_dir)
+
+
+def get_optional_interfaces():
+    """Return the optional interfaces that should be checked if the relavent
+    relations have appeared.
+    :returns: {general_interface: [specific_int1, specific_int2, ...], ...}
+    """
+    optional_interfaces = {}
+    if relation_ids('ha'):
+        optional_interfaces['ha'] = ['cluster']
+    return optional_interfaces
 
 
 def check_optional_relations(configs):
-    required_interfaces = {}
+    """Check that if we have a relation_id for high availability that we can
+    get the hacluster config.  If we can't then we are blocked.
+
+    This function is called from assess_status/set_os_workload_status as the
+    charm_func and needs to return either "unknown", "" if there is no problem
+    or the status, message if there is a problem.
+
+    :param configs: an OSConfigRender() instance.
+    :return 2-tuple: (string, string) = (status, message)
+    """
     if relation_ids('ha'):
-        required_interfaces['ha'] = ['cluster']
         try:
             get_hacluster_config()
         except:
@@ -1268,11 +1334,9 @@ def check_optional_relations(configs):
                     'hacluster missing configuration: '
                     'vip, vip_iface, vip_cidr')
 
-    if required_interfaces:
-        set_os_workload_status(configs, required_interfaces)
-        return status_get()
-    else:
-        return 'unknown', 'No optional relations'
+    # return 'unknown' as the lowest priority to not clobber an existing
+    # status.
+    return 'unknown', ''
 
 
 def assess_status(configs):
@@ -1296,15 +1360,21 @@ def assess_status_func(configs):
     Used directly by assess_status() and also for pausing and resuming
     the unit.
 
+    NOTE: REQUIRED_INTERFACES is augmented with the optional interfaces
+    depending on the current config before being passed to the
+    make_assess_status_func() function.
+
     NOTE(ajkavanagh) ports are not checked due to race hazards with services
     that don't behave sychronously w.r.t their service scripts.  e.g.
     apache2.
     @param configs: a templating.OSConfigRenderer() object
     @return f() -> None : a function that assesses the unit's workload status
     """
+    required_interfaces = REQUIRED_INTERFACES.copy()
+    required_interfaces.update(get_optional_interfaces())
     active_services = [s for s in services() if s not in STOPPED_SERVICES]
     return make_assess_status_func(
-        configs, REQUIRED_INTERFACES,
+        configs, required_interfaces,
         charm_func=check_optional_relations,
         services=active_services, ports=None)
 

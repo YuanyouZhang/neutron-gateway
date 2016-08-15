@@ -43,7 +43,7 @@ from charmhelpers.core.sysctl import create as create_sysctl
 
 from charmhelpers.contrib.charmsupport import nrpe
 from charmhelpers.contrib.hardening.harden import harden
-from subprocess import check_call
+
 import sys
 from neutron_utils import (
     L3HA_PACKAGES,
@@ -69,13 +69,11 @@ from neutron_utils import (
     use_l3ha,
     NEUTRON_COMMON,
     assess_status,
+    install_systemd_override,
 )
 
 hooks = Hooks()
 CONFIGS = register_configs()
-DEBPACKS = ['dkms', 'libc6-dev', 'make', 'kmod', 'netbase', 'procps',
-            'python-argparse', 'uuid-runtime', 'python:any', 'libssl1.0.0',
-            'linux-headers-3.16.0-71-generic']
 
 
 @hooks.hook('install.real')
@@ -103,20 +101,13 @@ def install():
         log(message, level=ERROR)
         status_set('blocked', message)
         sys.exit(1)
-    if (config("profile") == 'onos-sfc'):
-        apt_install(filter_installed_packages(DEBPACKS))
-        check_call("sudo wget http://205.177.226.237:9999/onosfw\
-/package_ovs_debian.tar.gz -O ovs.tar", shell=True)
-        check_call("sudo tar xvf ovs.tar", shell=True)
-        check_call("sudo dpkg -i openvswitch-common_2.5.90-1_amd64.deb",
-                   shell=True)
-        check_call("sudo dpkg -i openvswitch-datapath-dkms_2.5.90-1_all.deb",
-                   shell=True)
-        check_call("sudo dpkg -i openvswitch-switch_2.5.90-1_amd64.deb",
-                   shell=True)
-        status_set('maintenance', 'openvswitch 2.5.9 installed')
+
     # Legacy HA for Icehouse
     update_legacy_ha_files()
+
+    # Install systemd overrides to remove service startup race between
+    # n-gateway and n-cloud-controller services.
+    install_systemd_override()
 
 
 @hooks.hook('config-changed')
@@ -174,6 +165,10 @@ def upgrade_charm():
     install()
     config_changed()
     update_legacy_ha_files(force=True)
+
+    # Install systemd overrides to remove service startup race between
+    # n-gateway and n-cloud-controller services.
+    install_systemd_override()
 
 
 @hooks.hook('amqp-nova-relation-joined')
@@ -240,11 +235,10 @@ def nm_changed():
     # NOTE: nova-api-metadata needs to be restarted
     #       once the nova-conductor is up and running
     #       on the nova-cc units.
-    restart_nonce = relation_get('restart_nonce')
+    restart_nonce = relation_get('restart_trigger')
     if restart_nonce is not None:
         db = kv()
-        previous_nonce = db.get('restart_nonce',
-                                restart_nonce)
+        previous_nonce = db.get('restart_nonce')
         if previous_nonce != restart_nonce:
             if not is_unit_paused_set():
                 service_restart('nova-api-metadata')

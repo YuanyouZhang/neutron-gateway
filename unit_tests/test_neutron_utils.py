@@ -20,16 +20,20 @@ TO_PATCH = [
     'apt_upgrade',
     'apt_install',
     'configure_installation_source',
+    'git_src_dir',
     'log',
     'add_bridge',
     'add_bridge_port',
     'headers_package',
     'full_restart',
+    'os_release',
+    'service',
     'service_running',
     'NetworkServiceContext',
     'ExternalPortContext',
     'unit_private_ip',
     'relations_of_type',
+    'render',
     'service_stop',
     'determine_dkms_package',
     'service_restart',
@@ -38,6 +42,7 @@ TO_PATCH = [
     'mkdir',
     'copy2',
     'NeutronAPIContext',
+    'init_is_systemd',
 ]
 
 openstack_origin_git = \
@@ -793,18 +798,30 @@ class TestNeutronAgentReallocation(CharmTestCase):
                                                  core_project='neutron')
         self.assertTrue(git_post.called)
 
+    @patch('subprocess.check_call')
     @patch.object(neutron_utils, 'mkdir')
     @patch.object(neutron_utils, 'write_file')
     @patch.object(neutron_utils, 'add_user_to_group')
     @patch.object(neutron_utils, 'add_group')
     @patch.object(neutron_utils, 'adduser')
     def test_git_pre_install(self, adduser, add_group, add_user_to_group,
-                             write_file, mkdir):
+                             write_file, mkdir, check_call):
         neutron_utils.git_pre_install()
-        adduser.assert_called_with('neutron', shell='/bin/bash',
-                                   system_user=True)
-        add_group.assert_called_with('neutron', system_group=True)
-        add_user_to_group.assert_called_with('neutron', 'neutron')
+        expected = [
+            call('neutron', shell='/bin/bash', system_user=True),
+            call('nova', shell='/bin/bash', system_user=True),
+        ]
+        self.assertEquals(adduser.call_args_list, expected)
+        expected = [
+            call('neutron', system_group=True),
+            call('nova', system_group=True),
+        ]
+        self.assertEquals(add_group.call_args_list, expected)
+        expected = [
+            call('neutron', 'neutron'),
+            call('nova', 'nova'),
+        ]
+        self.assertEquals(add_user_to_group.call_args_list, expected)
         expected = [
             call('/etc/neutron', owner='neutron',
                  group='neutron', perms=0755, force=False),
@@ -819,6 +836,10 @@ class TestNeutronAgentReallocation(CharmTestCase):
             call('/var/lib/neutron/lock', owner='neutron',
                  group='neutron', perms=0755, force=False),
             call('/var/log/neutron', owner='neutron',
+                 group='neutron', perms=0755, force=False),
+            call('/var/lib/nova', owner='neutron',
+                 group='neutron', perms=0755, force=False),
+            call('/var/log/nova', owner='neutron',
                  group='neutron', perms=0755, force=False),
         ]
         self.assertEquals(mkdir.call_args_list, expected)
@@ -863,18 +884,18 @@ class TestNeutronAgentReallocation(CharmTestCase):
         self.assertEquals(write_file.call_args_list, expected)
 
     @patch('os.remove')
-    @patch.object(neutron_utils, 'git_src_dir')
-    @patch.object(neutron_utils, 'render')
     @patch('os.path.join')
     @patch('os.path.exists')
     @patch('os.symlink')
     @patch('shutil.rmtree')
     @patch('shutil.copyfile')
     @patch('shutil.copytree')
-    def test_git_post_install(self, copytree, copyfile, rmtree, symlink,
-                              exists, join, render, git_src_dir, remove):
+    def test_git_post_install_upstart(self, copytree, copyfile, rmtree,
+                                      symlink, exists, join, remove):
         projects_yaml = openstack_origin_git
         join.return_value = 'joined-string'
+        self.lsb_release.return_value = {'DISTRIB_RELEASE': '15.04'}
+        self.os_release.return_value = 'liberty'
         neutron_utils.git_post_install(projects_yaml)
         expected = [
             call('joined-string', '/etc/neutron'),
@@ -1085,9 +1106,22 @@ class TestNeutronAgentReallocation(CharmTestCase):
                              '/etc/neutron/fwaas_driver.ini'],
             'log_file': '/var/log/neutron/vpn_agent.log',
         }
+        nova_api_metadata_context = {
+            'service_description': 'Nova Metadata API server',
+            'service_name': 'nova-compute',
+            'user_name': 'nova',
+            'start_dir': '/var/lib/nova',
+            'process_name': 'nova-api-metadata',
+            'executable_name': 'joined-string',
+            'config_files': ['/etc/nova/nova.conf'],
+        }
+
         expected = [
             call('git/neutron_sudoers',
                  '/etc/sudoers.d/neutron_sudoers',
+                 {}, perms=0o440),
+            call('git/nova_sudoers',
+                 '/etc/sudoers.d/nova_sudoers',
                  {}, perms=0o440),
             call('git/cron.d/neutron-dhcp-agent-netns-cleanup',
                  '/etc/cron.d/neutron-dhcp-agent-netns-cleanup',
@@ -1166,8 +1200,92 @@ class TestNeutronAgentReallocation(CharmTestCase):
             call('git/upstart/neutron-agent.upstart',
                  '/etc/init/neutron-vpn-agent.conf',
                  neutron_vpn_agent_context, perms=0o644),
+            call('git.upstart',
+                 '/etc/init/nova-api-metadata.conf',
+                 nova_api_metadata_context, perms=0o644,
+                 templates_dir='joined-string'),
         ]
-        self.assertEquals(render.call_args_list, expected)
+        self.assertEquals(self.render.call_args_list, expected)
+
+    @patch('os.listdir')
+    @patch('os.remove')
+    @patch('os.path.join')
+    @patch('os.path.exists')
+    @patch('os.symlink')
+    @patch('shutil.rmtree')
+    @patch('shutil.copyfile')
+    @patch('shutil.copytree')
+    def test_git_post_install_systemd(self, copytree, copyfile, rmtree,
+                                      symlink, exists, join, remove, listdir):
+        projects_yaml = openstack_origin_git
+        join.return_value = 'joined-string'
+        self.lsb_release.return_value = {'DISTRIB_RELEASE': '15.10'}
+        self.os_release.return_value = 'xenial'
+        neutron_utils.git_post_install(projects_yaml)
+
+        expected = [
+            call('git/neutron_sudoers',
+                 '/etc/sudoers.d/neutron_sudoers',
+                 {}, perms=288),
+            call('git/nova_sudoers',
+                 '/etc/sudoers.d/nova_sudoers',
+                 {}, perms=288),
+            call('git/cron.d/neutron-dhcp-agent-netns-cleanup',
+                 '/etc/cron.d/neutron-dhcp-agent-netns-cleanup',
+                 {}, perms=493),
+            call('git/cron.d/neutron-l3-agent-netns-cleanup',
+                 '/etc/cron.d/neutron-l3-agent-netns-cleanup',
+                 {}, perms=493),
+            call('git/cron.d/neutron-lbaas-agent-netns-cleanup',
+                 '/etc/cron.d/neutron-lbaas-agent-netns-cleanup',
+                 {}, perms=493),
+            call('git/neutron-dhcp-agent.init.in.template',
+                 'joined-string', {'daemon_path': 'joined-string'},
+                 perms=420),
+            call('git/neutron-l3-agent.init.in.template',
+                 'joined-string', {'daemon_path': 'joined-string'},
+                 perms=420),
+            call('git/neutron-lbaas-agent.init.in.template',
+                 'joined-string', {'daemon_path': 'joined-string'},
+                 perms=420),
+            call('git/neutron-lbaasv2-agent.init.in.template',
+                 'joined-string', {'daemon_path': 'joined-string'},
+                 perms=420),
+            call('git/neutron-linuxbridge-agent.init.in.template',
+                 'joined-string', {'daemon_path': 'joined-string'},
+                 perms=420),
+            call('git/neutron-linuxbridge-cleanup.init.in.template',
+                 'joined-string', {'daemon_path': 'joined-string'},
+                 perms=420),
+            call('git/neutron-macvtap-agent.init.in.template',
+                 'joined-string', {'daemon_path': 'joined-string'},
+                 perms=420),
+            call('git/neutron-metadata-agent.init.in.template',
+                 'joined-string', {'daemon_path': 'joined-string'},
+                 perms=420),
+            call('git/neutron-metering-agent.init.in.template',
+                 'joined-string', {'daemon_path': 'joined-string'},
+                 perms=420),
+            call('git/neutron-openvswitch-agent.init.in.template',
+                 'joined-string', {'daemon_path': 'joined-string'},
+                 perms=420),
+            call('git/neutron-ovs-cleanup.init.in.template',
+                 'joined-string', {'daemon_path': 'joined-string'},
+                 perms=420),
+            call('git/neutron-server.init.in.template',
+                 'joined-string', {'daemon_path': 'joined-string'},
+                 perms=420),
+            call('git/neutron-sriov-agent.init.in.template',
+                 'joined-string', {'daemon_path': 'joined-string'},
+                 perms=420),
+            call('git/neutron-vpn-agent.init.in.template',
+                 'joined-string', {'daemon_path': 'joined-string'},
+                 perms=420),
+            call('git/nova-api-metadata.init.in.template',
+                 'joined-string', {'daemon_path': 'joined-string'},
+                 perms=420),
+        ]
+        self.assertEquals(self.render.call_args_list, expected)
 
     def test_assess_status(self):
         with patch.object(neutron_utils, 'assess_status_func') as asf:
@@ -1177,6 +1295,7 @@ class TestNeutronAgentReallocation(CharmTestCase):
             asf.assert_called_once_with('test-config')
             callee.assert_called_once_with()
 
+    @patch.object(neutron_utils, 'get_optional_interfaces')
     @patch.object(neutron_utils, 'check_optional_relations')
     @patch.object(neutron_utils, 'REQUIRED_INTERFACES')
     @patch.object(neutron_utils, 'services')
@@ -1185,12 +1304,16 @@ class TestNeutronAgentReallocation(CharmTestCase):
                                 make_assess_status_func,
                                 services,
                                 REQUIRED_INTERFACES,
-                                check_optional_relations):
+                                check_optional_relations,
+                                get_optional_interfaces):
         services.return_value = ['s1']
+        REQUIRED_INTERFACES.copy.return_value = {'int': ['test 1']}
+        get_optional_interfaces.return_value = {'opt': ['test 2']}
         neutron_utils.assess_status_func('test-config')
         # ports=None whilst port checks are disabled.
         make_assess_status_func.assert_called_once_with(
-            'test-config', REQUIRED_INTERFACES,
+            'test-config',
+            {'int': ['test 1'], 'opt': ['test 2']},
             charm_func=check_optional_relations, services=['s1'], ports=None)
 
     def test_pause_unit_helper(self):
@@ -1213,3 +1336,28 @@ class TestNeutronAgentReallocation(CharmTestCase):
             asf.assert_called_once_with('some-config')
             # ports=None whilst port checks are disabled.
             f.assert_called_once_with('assessor', services=['s1'], ports=None)
+
+    @patch.object(neutron_utils, 'subprocess')
+    @patch.object(neutron_utils, 'shutil')
+    @patch('os.path.exists')
+    def test_install_systemd_override_systemd(self, _os_exists, _shutil,
+                                              _subprocess):
+        '''
+        Ensure systemd override is only installed on systemd based systems
+        '''
+        self.init_is_systemd.return_value = True
+        _os_exists.return_value = False
+        neutron_utils.install_systemd_override()
+        _os_exists.assert_called_with(
+            '/etc/systemd/system/nova-api-metadata.service.d/override.conf'
+        )
+        self.mkdir.assert_called_with(
+            '/etc/systemd/system/nova-api-metadata.service.d'
+        )
+        _shutil.copy.assert_called_with(
+            'files/override.conf',
+            '/etc/systemd/system/nova-api-metadata.service.d/override.conf'
+        )
+        _subprocess.check_call.assert_called_with(
+            ['systemctl', 'daemon-reload']
+        )

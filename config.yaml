@@ -38,22 +38,39 @@ options:
 
       NOTE: updating this setting to a source that is known to provide
       a later version of OpenStack will trigger a software upgrade.
-
-      NOTE: when openstack-origin-git is specified, OpenStack specific
-      packages will be installed from source rather than from the
-      openstack-origin repository.
   openstack-origin-git:
     default:
     type: string
     description: |
-      Specifies a YAML-formatted dictionary listing the git
-      repositories and branches from which to install OpenStack and
-      its dependencies.
+      Specifies a default OpenStack release name, or a YAML dictionary
+      listing the git repositories to install from.
 
-      Note that the installed config files will be determined based on
-      the OpenStack release of the openstack-origin option.
+      The default Openstack release name may be one of the following, where
+      the corresponding OpenStack github branch will be used:
+        * liberty
+        * mitaka
+        * master
 
-      For more details see README.md.
+      The YAML must minimally include requirements, neutron-fwaas,
+      neutron-lbaas, neutron-vpnaas, and neutron repositories, and may
+      also include repositories for other dependencies:
+        repositories:
+        - {name: requirements,
+           repository: 'git://github.com/openstack/requirements',
+           branch: master}
+        - {name: neutron-fwaas,
+           repository: 'git://github.com/openstack/neutron-fwaas',
+           branch: master}
+        - {name: neutron-lbaas,
+           repository: 'git://github.com/openstack/neutron-lbaas',
+           branch: master}
+        - {name: neutron-vpnaas,
+           repository: 'git://github.com/openstack/neutron-vpnaas',
+           branch: master}
+        - {name: neutron,
+           repository: 'git://github.com/openstack/neutron',
+           branch: master}
+        release: master
   plugin:
     default: ovs
     type: string
@@ -69,6 +86,10 @@ options:
     type: string
     default:
     description: |
+      Deprecated: Use bridge-mappings and data-port to create a network
+      which can be used for external connectivity.  You can call the network
+      external and the bridge br-ex by convention, but neither is required.
+
       Space-delimited list of external ports to use for routing of instance
       traffic to the external public network. Valid values are either MAC
       addresses (in which case only MAC addresses for interfaces without an IP
@@ -232,8 +253,10 @@ options:
     description: |
       Apply system hardening. Supports a space-delimited list of modules
       to run. Supported modules currently include os, ssh, apache and mysql.
-  profile:
-    default:
-    type: string
+  worker-multiplier:
+    type: float
+    default: 2.0
     description: |
-      Onos sfc nsh patch install config.
+      The CPU core multiplier to use when configuring worker processes for
+      neutron and nova-metadata-api. By default, the number of workers for
+      each daemon is set to twice the number of CPU cores a service unit has.
