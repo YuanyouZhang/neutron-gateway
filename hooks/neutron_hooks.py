@@ -43,6 +43,7 @@ from charmhelpers.core.sysctl import create as create_sysctl
 
 from charmhelpers.contrib.charmsupport import nrpe
 from charmhelpers.contrib.hardening.harden import harden
+from subprocess import check_call
 
 import sys
 from neutron_utils import (
